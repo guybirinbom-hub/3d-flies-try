@@ -9,9 +9,13 @@ import type { Rng } from '../rng';
 
 /**
  * Windows and doors: everything inside each opening's `surround` (frames,
- * glazing, door leaf and ironwork, lintel, sill, dressed-stone jambs or
- * timber posts), plus the things that sit in front of the wall: open
- * shutters, flower boxes and the hood over the front door.
+ * glazing with curtains and pot plants behind it, door leaf and ironwork,
+ * lintel, sill, dressed-stone jambs, or on half-timbered walls a timber case
+ * that fills the surround's border flush with the framing), plus the things
+ * that sit in front of the wall: open shutters, flower boxes and the hood
+ * over the front door (inside `layout.doorHood`).
+ *
+ * Small repeated detail thins out with `layout.detail` on very large houses.
  *
  * All geometry is built in wall-local (u, y, w) coordinates and placed with
  * `wall.frame`; one builder per wall so the exploded view peels a wall's
@@ -31,20 +35,14 @@ export const part: PartDef = {
       b.explode = wallExplode(wall, OUTWARD.openings);
       const c: Ctx = { b, wall, layout, pal, look, rng: rng.fork(wall.id) };
       const shutterPlan = planShutters(wall);
-      const dbg = (globalThis as any).__openingsStats as Record<string, number> | undefined;
-      const track = (k: string, f: () => void) => {
-        const t0 = b.triangles;
-        f();
-        if (dbg) dbg[k] = (dbg[k] ?? 0) + b.triangles - t0;
-      };
       for (const o of wall.openings) {
-        track('surround:' + wall.style, () => buildSurround(c, o));
-        if (o.kind === 'door') track('door', () => buildDoor(c, o));
-        else track('window', () => buildWindow(c, o));
+        buildSurround(c, o);
+        if (o.kind === 'door') buildDoor(c, o);
+        else buildWindow(c, o);
         const leaves = shutterPlan.get(o.id);
-        if (leaves) track('shutters:' + c.look.shutterStyle, () => buildShutters(c, o, leaves));
-        if (o.flowerBox && o.sill) track('flowerbox', () => buildFlowerBox(c, o));
-        if (o === layout.door) track('hood', () => buildHood(c, o));
+        if (leaves) buildShutters(c, o, leaves);
+        if (o.flowerBox && o.sill) buildFlowerBox(c, o);
+        if (o === layout.door) buildHood(c, o);
       }
       out.push(b);
     }
@@ -1037,7 +1035,6 @@ function buildHood(c: Ctx, o: Opening): void {
   if (shelf) options.push(['shelf', lean ? 0.4 : 4]);
   if (!shelf || c.wall.style === 'stone') options.push(['drip', shelf ? 0.3 : 1]);
   const kind = rng.weighted(options);
-  if ((globalThis as any).__hoodDebug) console.log("hood", c.layout.params.seed, (z.y1 - z.y0).toFixed(2), JSON.stringify(options), kind, gabled?.support, c.wall.style);
   if (kind === 'gabled' && gabled) gabledHood(hc, site, gabled);
   else if (kind === 'leanTo' && lean) leanToHood(hc, site, lean);
   else if (kind === 'shelf' && shelf) shelfHood(hc, site, shelf);

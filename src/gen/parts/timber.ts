@@ -12,14 +12,20 @@ import type { Rng } from '../rng';
  * Everything that lies in a wall plane is a convex polygon in wall-local
  * (u, y), extruded along w with a softly rounded front edge (see
  * `prismGeometry`). Members are laid out as a carpenter would: sill and top
- * plate run continuously, corner posts and window posts stand between them,
- * studs keep plaster panels small, rails line up with the window sills and
- * lintels, and braces fill some panels. Members never overlap in the same
+ * plate run continuously, corner posts stand between them, studs keep
+ * plaster panels small, rails line up with the window sill rails and
+ * lintels, and braces fill some panels (a tall knee wall above the window
+ * heads gets a knee rail and head braces). Members never overlap in the same
  * depth layer: they either abut exactly, or the one tucked underneath sits
  * a few millimetres further back (see `W`), so nothing z-fights.
  *
- * Gable triangles get edge rafters, a king post (or posts around the attic
- * window), studs, a collar and struts, all clipped 2 cm below the roof line.
+ * The posts, lintel and sill rail of a window or door are the openings
+ * part's (they fill the surround's border); this part continues the post
+ * columns above and below the surround and butts its rails and braces
+ * against the surround's edges.
+ *
+ * Gable triangles get edge rafters, a king post (or the attic windows' post
+ * columns), studs, a collar and struts, all clipped 2 cm below the roof line.
  */
 export const part: PartDef = {
   name: 'timber',
