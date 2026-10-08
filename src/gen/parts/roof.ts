@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { PartBuilder, boxGeometry, mat4, mix, mul, vary, type MatKey } from '../builder';
 import { roofLift } from '../explode';
 import type { PartDef } from '../house';
-import type { HouseLayout, Opening, Side, WallSpec } from '../layout';
+import type { HouseLayout, Opening, RoofCovering, Side, WallSpec } from '../layout';
 import type { Rng } from '../rng';
 
 /**
@@ -25,7 +25,8 @@ import type { Rng } from '../rng';
 // Tile styles
 // ---------------------------------------------------------------------------
 
-type TileKind = 'beaver' | 'fish' | 'slate' | 'shingle';
+/** The covering is chosen by the layout (`layout.roof.covering`). */
+type TileKind = RoofCovering;
 
 interface TileStyle {
   kind: TileKind;
@@ -70,18 +71,6 @@ const TILE_STYLES: Record<TileKind, TileStyle> = {
     irregular: true, jitter: [0.05, 0.04, 0.01], wave: 0.016,
   },
 };
-
-/** Roof covering that suits the palette's roof colour. */
-function pickTileStyle(roofColor: string, rng: Rng): TileStyle {
-  const hsl = { h: 0, s: 0, l: 0 };
-  new THREE.Color(roofColor).getHSL(hsl, THREE.SRGBColorSpace); // classify as authored, not in linear space
-  let weights: [TileKind, number][];
-  if (hsl.s < 0.18) weights = [['slate', 5], ['shingle', 2], ['fish', 2], ['beaver', 0.5]]; // grey / blue (weathered shingles are grey too)
-  else if (hsl.h > 0.17 && hsl.h < 0.45) weights = [['shingle', 4], ['beaver', 2], ['fish', 1]]; // mossy green
-  else if (hsl.h < 0.1 || hsl.h > 0.9) weights = [['beaver', 6], ['fish', 2]]; // terracotta reds
-  else weights = [['beaver', 3], ['slate', 2], ['shingle', 2], ['fish', 1]];
-  return TILE_STYLES[rng.weighted(weights)];
-}
 
 // ---------------------------------------------------------------------------
 // Dimensions shared by every piece of the roof
@@ -283,7 +272,7 @@ export const part: PartDef = {
   label: 'Roof',
   explode: [0, 0, 0],
   build: ({ layout, rng }) => {
-    const style = pickTileStyle(layout.params.palette.roof, rng.fork('style'));
+    const style = TILE_STYLES[layout.roof.covering];
     const d = roofDims(layout, style, rng.fork('dims'));
     const colors = roofColors(layout, rng.fork('colors'));
     const lift = roofLift(layout);

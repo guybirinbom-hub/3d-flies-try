@@ -31,6 +31,7 @@ const server = await createServer({
   logLevel: 'error',
   cacheDir: join(tmpdir(), `vite-sweep-${process.pid}`),
   server: { middlewareMode: true, hmr: false, watch: null, ws: false },
+  optimizeDeps: { noDiscovery: true },
   appType: 'custom',
 });
 const errors = [];

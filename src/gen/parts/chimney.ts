@@ -59,9 +59,9 @@ const FLASH = {
    * outer edges so the lead looks dressed into the tile courses. The apron's
    * edge stays higher so it still covers the tile tails below it.
    */
-  lift: -0.004,
-  edgeLift: -0.034,
-  apronEdgeLift: -0.018,
+  lift: 0.016,
+  edgeLift: 0.003,
+  apronEdgeLift: 0.013,
   /** How far sheets and upstands reach below the tile surface (perpendicular), hiding the roof hole's edge. */
   drop: 0.07,
   /** Collar width beside the stack (over the side tiles). */

@@ -51,6 +51,8 @@ const WALL_GAP = 0.13;
 const PLINTH_REACH = 0.1;
 /** How far below a window sill a flower box (with its trailing plants) may hang. */
 const FLOWER_BOX_DROP = 0.42;
+/** Perimeter (m) of a house that gets full-density planting; larger houses are planted more sparsely. */
+const PLANTED_PERIMETER = 30;
 /** How far a grass tuft's leaning blades can reach from its root. */
 const TUFT_REACH = 0.17;
 
@@ -72,6 +74,7 @@ const END_GRAIN = '#d9ba8c';
 const SPLIT_WOOD = '#c39468';
 const BARK = '#644935';
 const WEATHERED = '#9c907f';
+const FLOWER_EYE = new THREE.Color('#e3a92e');
 
 // ---------------------------------------------------------------------------
 // Site plan: where things may go
@@ -535,30 +538,33 @@ function stoneOutline(rng: Rng, rx: number, rz: number): THREE.Vector2[] {
 }
 
 /**
- * Five-petal-ish flower: a rim of radius 1 at y = 0.2 around a slightly sunken
- * centre, tapering to a narrow base at y = -0.2. 3n triangles.
+ * Little open flower facing +y, radius 1: `petals` rounded tips around a
+ * slightly sunken centre (y = 0.12), the rim at y ≈ 0.2, tapering to a narrow
+ * base at y = -0.2 that hides in the foliage (no bottom cap). 5 × petals
+ * triangles.
  */
-function flowerCupGeometry(n: number): THREE.BufferGeometry {
+function flowerGeometry(petals: number): THREE.BufferGeometry {
+  const n = petals * 2; // rim alternates petal tip / notch
   const pos: number[] = [0, 0.12, 0];
   for (let i = 0; i < n; i++) {
     const a = (i / n) * Math.PI * 2;
-    pos.push(Math.cos(a), 0.2, Math.sin(a));
+    const r = i % 2 === 0 ? 1 : 0.68; // shallow notches: rounded petals, not a star
+    pos.push(Math.cos(a) * r, i % 2 === 0 ? 0.22 : 0.18, Math.sin(a) * r);
   }
-  for (let i = 0; i < n; i++) {
-    const a = ((i + 0.5) / n) * Math.PI * 2;
-    pos.push(Math.cos(a) * 0.35, -0.2, Math.sin(a) * 0.35);
+  for (let i = 0; i < petals; i++) {
+    const a = ((i * 2 + 1) / n) * Math.PI * 2; // under the notches
+    pos.push(Math.cos(a) * 0.3, -0.2, Math.sin(a) * 0.3);
   }
+  const rim = (i: number) => 1 + (i % n);
+  const base = (j: number) => 1 + n + (j % petals);
   const idx: number[] = [];
-  for (let i = 0; i < n; i++) {
-    const r0 = 1 + i;
-    const r1 = 1 + ((i + 1) % n);
-    const b0 = 1 + n + i;
-    idx.push(0, r1, r0, r0, r1, b0);
-  }
-  for (let i = 0; i < n; i++) {
-    const b0 = 1 + n + i;
-    const b1 = 1 + n + ((i + 1) % n);
-    idx.push(1 + ((i + 1) % n), b1, b0);
+  for (let i = 0; i < n; i++) idx.push(0, rim(i + 1), rim(i)); // face
+  for (let j = 0; j < petals; j++) {
+    // Underside of petal j (tip 2j between notches 2j-1 and 2j+1) down to the base ring.
+    const tip = 2 * j;
+    idx.push(rim(tip), rim(tip + 1), base(j)); // tip → next notch → base under that notch
+    idx.push(rim(tip + n - 1), rim(tip), base(j + petals - 1)); // previous notch → tip → base under it
+    idx.push(rim(tip), base(j), base(j + petals - 1));
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
@@ -583,8 +589,7 @@ const FLOWER_HEAD = new THREE.OctahedronGeometry(1, 0);
 const UP = new THREE.Vector3(0, 1, 0);
 /** Small rounded lump (20 triangles, smooth normals): pebbles, leaves, buds. */
 const PEBBLE = smoothed(new THREE.IcosahedronGeometry(1, 0));
-/** Open flower facing +y: a shallow five-sided cup, radius 1 (no bottom, it sits in foliage). */
-const FLOWER_CUP = flowerCupGeometry(5);
+const FLOWER = flowerGeometry(5);
 const HOLLYHOCK_STEM = new THREE.CylinderGeometry(0.011, 0.017, 1, 5, 1, true).translate(0, 0.5, 0);
 
 // ---------------------------------------------------------------------------
@@ -1493,6 +1498,10 @@ type PlantKind = 'shrub' | 'flowers' | 'hollyhock';
  */
 function buildPlanting(site: Site, rng: Rng): PartBuilder[] {
   const lush = rng.range(0.6, 1);
+  // Big houses get wider gaps between plants so the part stays inside its
+  // triangle budget (they are seen from further away, so it reads the same).
+  const perimeter = site.walls.reduce((s, w) => s + w.length, 0);
+  const extraGap = Math.max(0, perimeter / PLANTED_PERIMETER - 1) * 1.1;
   const flowers = flowerColors(site.palette);
   const builders = new Map<WallSpec, PartBuilder>();
   for (const wall of site.walls) {
@@ -1500,11 +1509,11 @@ function buildPlanting(site: Site, rng: Rng): PartBuilder[] {
     b.explode = wallExplode(wall, OUTWARD.props);
     builders.set(wall, b);
     const sideFactor = wall.side === 'front' ? 1.25 : wall.side === 'back' ? 0.7 : 0.9;
-    plantAlongWall(b, rng, site, wall, lush * sideFactor * rng.range(0.8, 1.2), flowers);
+    plantAlongWall(b, rng, site, wall, lush * sideFactor * rng.range(0.8, 1.2), extraGap, flowers);
   }
   for (const wall of site.walls) {
     const b = builders.get(wall)!;
-    const count = Math.round(wall.length * 2.4 * (0.6 + lush * 0.6));
+    const count = Math.round(wall.length * 2.4 * (0.6 + lush * 0.6) * Math.min(1, PLANTED_PERIMETER / perimeter));
     for (let i = 0; i < count; i++) {
       const u = rng.range(-0.05, wall.length + 0.05);
       const w = WALL_GAP + 0.02 + Math.pow(rng.next(), 1.6) * 0.6;
@@ -1523,7 +1532,7 @@ function buildPlanting(site: Site, rng: Rng): PartBuilder[] {
   return [...builders.values()];
 }
 
-function plantAlongWall(b: PartBuilder, rng: Rng, site: Site, wall: WallSpec, lush: number, flowers: THREE.Color[]): void {
+function plantAlongWall(b: PartBuilder, rng: Rng, site: Site, wall: WallSpec, lush: number, extraGap: number, flowers: THREE.Color[]): void {
   // A dominant flower colour per wall keeps the beds from looking like confetti.
   const main = rng.pick(flowers);
   let u = rng.range(0.05, 0.6);
@@ -1556,7 +1565,7 @@ function plantAlongWall(b: PartBuilder, rng: Rng, site: Site, wall: WallSpec, lu
     else addFlowerClump(b, rng, m, size.w, size.h, rng.chance(0.6) ? [color] : flowers, depth / 2);
     const foot = wallPoint(wall, u + size.w * rng.range(0, 1), 0, WALL_GAP + depth);
     site.anchors.push({ x: foot.x, z: foot.z, wall });
-    u += size.w + rng.range(-0.1, 0.7) / lush;
+    u += size.w + rng.range(-0.1, 0.7) / lush + extraGap * rng.range(0.5, 1.5);
   }
 }
 
@@ -1668,13 +1677,13 @@ function addShrub(b: PartBuilder, rng: Rng, m: THREE.Matrix4, width: number, hei
     blobs.push(lump);
   }
   if (flower) {
-    const count = Math.round(width * 22);
-    for (let i = 0; i < count; i++) addFlowerOnBlob(b, rng, m, rng.pick(blobs), flower, 0.032);
+    const count = Math.round(width * 15);
+    for (let i = 0; i < count; i++) addFlowerOnBlob(b, rng, m, rng.pick(blobs), flower, 0.036);
   }
 }
 
 /**
- * Little open flower (a hexagonal cup with a darker throat) sitting on the
+ * Little open flower (five petals around a golden eye) sitting on the
  * upper surface of a foliage blob, facing out along the surface normal.
  */
 function addFlowerOnBlob(b: PartBuilder, rng: Rng, m: THREE.Matrix4, blob: Blob, color: THREE.Color, size: number): void {
@@ -1687,15 +1696,15 @@ function addFlowerOnBlob(b: PartBuilder, rng: Rng, m: THREE.Matrix4, blob: Blob,
   const q = new THREE.Quaternion().setFromUnitVectors(UP, normal);
   q.multiply(new THREE.Quaternion().setFromAxisAngle(UP, rng.range(0, Math.PI)));
   const fm = new THREE.Matrix4().compose(pos, q, new THREE.Vector3(s, s, s));
-  addFlowerCup(b, fm, vary(color, rng, 0.05, 0.04, 0.01), s);
+  addFlowerHead(b, fm, vary(color, rng, 0.05, 0.04, 0.01), s);
 }
 
-/** A FLOWER_CUP placed by `fm` (scale s), painted with a darker throat. */
-function addFlowerCup(b: PartBuilder, fm: THREE.Matrix4, color: THREE.Color, s: number): void {
-  const throat = color.clone().multiplyScalar(0.62);
-  const centre = new THREE.Vector3(0, 0.2, 0).applyMatrix4(fm);
-  b.add(FLOWER_CUP, 'flower', color, fm, (p, _n, out) => {
-    out.copy(throat).lerp(color, THREE.MathUtils.clamp(p.distanceTo(centre) / (s * 0.75), 0, 1));
+/** A FLOWER placed by `fm` (radius s), with a warm golden eye fading out to the petal tips. */
+function addFlowerHead(b: PartBuilder, fm: THREE.Matrix4, color: THREE.Color, s: number): void {
+  const eye = color.clone().lerp(FLOWER_EYE, 0.55).multiplyScalar(0.85);
+  const centre = new THREE.Vector3(0, 0.12, 0).applyMatrix4(fm);
+  b.add(FLOWER, 'flower', color, fm, (p, _n, out) => {
+    out.copy(eye).lerp(color, smoothstep(0.15, 0.6, p.distanceTo(centre) / s));
   });
 }
 
@@ -1711,7 +1720,7 @@ function addFlowerClump(b: PartBuilder, rng: Rng, m: THREE.Matrix4, width: numbe
   mound.v = addShrubBlob(b, rng, m, 0, mound.y, 0, rx, ry, rz, leaf, rx > 0.28 ? 2 : 1, height);
   // Smaller blooms on small clumps (pots on a bench) so they don't look like blotches.
   const size = Math.min(0.034, 0.012 + width * 0.05);
-  const count = Math.round(6 + width * 22);
+  const count = Math.round(4 + width * 16);
   for (let i = 0; i < count; i++) addFlowerOnBlob(b, rng, m, mound, rng.pick(colors), size);
 }
 
@@ -1746,7 +1755,7 @@ function addHollyhocks(b: PartBuilder, rng: Rng, m: THREE.Matrix4, width: number
         b.add(PEBBLE, 'foliage', c.clone().lerp(leaf, 0.55), mul(fm, mat4(0, 0, 0, 0, 0, 0, 0.6, 1.4, 0.6)));
         continue;
       }
-      addFlowerCup(b, fm, c, s);
+      addFlowerHead(b, fm, c, s);
     }
   }
 }

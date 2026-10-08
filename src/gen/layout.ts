@@ -1,4 +1,4 @@
-import { Matrix4, Vector3 } from 'three';
+import { Color, Matrix4, SRGBColorSpace, Vector3 } from 'three';
 import type { HouseParams, WallStyle } from './params';
 import { Rng } from './rng';
 
@@ -127,8 +127,24 @@ export interface StoreySpec {
   joistZone: number;
 }
 
+/** What the roof is covered with (decided here so roof, chimney flashing and door hoods agree). */
+export type RoofCovering = 'beaver' | 'fish' | 'slate' | 'shingle';
+
+/**
+ * Average height of each covering's visible tile surface above the deck,
+ * perpendicular to the slope: head clearance + half a tile + the rise of a
+ * tile's tail over the course below (+ the average hand-laid sag).
+ */
+const COVER_TOP: Record<RoofCovering, number> = {
+  beaver: 0.083,
+  fish: 0.078,
+  slate: 0.065,
+  shingle: 0.092,
+};
+
 export interface RoofSpec {
   type: 'gable';
+  covering: RoofCovering;
   /** Pitch in radians. */
   pitch: number;
   /** Underside of the roof meets the top storey's outer eave-wall face at this height. */
@@ -144,7 +160,11 @@ export interface RoofSpec {
   overhangGable: number;
   /** Thickness of the roof deck (boards/rafters), measured perpendicular to the slope. */
   deckThickness: number;
-  /** Total thickness of deck + covering (tiles), perpendicular to the slope. */
+  /**
+   * Deck + covering, perpendicular to the slope: `roofSurfaceY` is the
+   * average top of the visible tile surface (individual tile tails stand
+   * ≈1–2 cm proud of it, the ridge cap more).
+   */
   coverThickness: number;
 }
 
@@ -437,8 +457,11 @@ export function computeLayout(p: HouseParams): HouseLayout {
 
   const top = storeys[storeys.length - 1];
   const pitch = (p.roofPitch * Math.PI) / 180;
+  const covering = pickCovering(p.palette.roof, rng.fork('covering'));
+  const deckThickness = 0.12;
   const roof: RoofSpec = {
     type: 'gable',
+    covering,
     pitch,
     eaveY: top.y1,
     halfDepth: top.maxZ,
@@ -447,8 +470,8 @@ export function computeLayout(p: HouseParams): HouseLayout {
     maxX: top.maxX,
     overhangEave: p.eaveOverhang,
     overhangGable: p.gableOverhang,
-    deckThickness: 0.12,
-    coverThickness: 0.24,
+    deckThickness,
+    coverThickness: deckThickness + COVER_TOP[covering],
   };
 
   let chimney: ChimneySpec | null = null;
@@ -495,6 +518,18 @@ export function computeLayout(p: HouseParams): HouseLayout {
     topY: storeys[0].floorY,
   };
   return { params: p, storeys, walls, openings: allOpenings, door: d, stoop, roof, chimney, bounds };
+}
+
+/** A covering that suits the palette's roof colour (classified as authored, in sRGB). */
+function pickCovering(roofColor: string, rng: Rng): RoofCovering {
+  const hsl = { h: 0, s: 0, l: 0 };
+  new Color(roofColor).getHSL(hsl, SRGBColorSpace);
+  let weights: [RoofCovering, number][];
+  if (hsl.s < 0.18) weights = [['slate', 5], ['shingle', 2], ['fish', 2], ['beaver', 0.5]]; // grey / blue
+  else if (hsl.h > 0.17 && hsl.h < 0.45) weights = [['shingle', 4], ['beaver', 2], ['fish', 1]]; // mossy green
+  else if (hsl.h < 0.1 || hsl.h > 0.9) weights = [['beaver', 6], ['fish', 2]]; // terracotta reds
+  else weights = [['beaver', 3], ['slate', 2], ['shingle', 2], ['fish', 1]];
+  return rng.weighted(weights);
 }
 
 /** Evenly spaced centres along a wall, keeping `margin` clear at both ends. */

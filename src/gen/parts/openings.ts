@@ -938,14 +938,13 @@ function bracket(c: Ctx, u: number, topY: number, reach: number, slope: number, 
 /**
  * Staggered courses of small tiles on a slope. `frame` maps slope-local
  * coordinates: x along the eave, y out of the roof, z down the slope. Each
- * tile's tail rests on the course below; warm (terracotta) roofs get
- * round-ended "beaver tail" tiles like the main roof, others plain slates.
+ * tile's tail rests on the course below; beaver-tail and fish-scale roofs
+ * get round-ended tiles like the main roof, others plain slates.
  */
 function layTiles(c: Ctx, frame: THREE.Matrix4, x0: number, x1: number, z0: number, z1: number): void {
   const { rng, pal } = c;
-  const hsl = { h: 0, s: 0, l: 0 };
-  new THREE.Color(pal.roof).getHSL(hsl);
-  const rounded = hsl.s >= 0.18 && (hsl.h < 0.1 || hsl.h > 0.9);
+  // Match the main roof: round-ended tiles under clay coverings, flat slates otherwise.
+  const rounded = c.layout.roof.covering === 'beaver' || c.layout.roof.covering === 'fish';
   const courses = Math.max(2, Math.round((z1 - z0) / 0.12));
   const gauge = (z1 - z0) / courses;
   const n = Math.max(2, Math.round((x1 - x0) / 0.15));
