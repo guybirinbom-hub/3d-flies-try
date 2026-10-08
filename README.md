@@ -9,6 +9,15 @@ beam, shutter and flower is placed by a generator and painted with vertex
 colours, so the output exports cleanly to glTF (`.glb`) for Blender, Godot,
 Unity or the web.
 
+![A generated house](docs/img/house.jpg)
+
+| Exploded into its generated layers | A village of nine seeds |
+|---|---|
+| ![Exploded view](docs/img/exploded.jpg) | ![Village](docs/img/village.jpg) |
+| ![Door detail](docs/img/door.jpg) | ![Cottage with a dormer](docs/img/cottage.jpg) |
+
+![Sixteen random seeds](docs/img/variety.jpg)
+
 ## Run it
 
 ```bash

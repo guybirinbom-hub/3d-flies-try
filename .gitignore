@@ -3,3 +3,4 @@ dist/
 shots/
 *.log
 .DS_Store
+renders/
