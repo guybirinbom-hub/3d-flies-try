@@ -57,6 +57,10 @@ export interface HouseParams {
   flowerBoxes: boolean;
   /** Small decorative props around the house (lantern, bench, barrel, plants). */
   props: boolean;
+  /** Dormers on the roof: -1 lets the generator decide, otherwise 0–3. */
+  dormers: number;
+  /** Roof covering, or 'auto' to pick one that suits the roof colour. */
+  roofCovering: 'auto' | 'beaver' | 'fish' | 'slate' | 'shingle';
   palette: Palette;
 }
 
@@ -90,8 +94,8 @@ export const PALETTES: Record<string, Palette> = {
     timber: '#6a4a33',
     wood: '#865e3c',
     trim: '#f6f1e4',
-    shutter: '#a2493d',
-    roof: '#5f7d4f',
+    shutter: '#7f97a8',
+    roof: '#6b6e4a',
     flowers: ['#f4d35e', '#ee964b', '#f7f3ea'],
   },
   rose: {
@@ -174,6 +178,8 @@ export function defaultParams(): HouseParams {
     shutters: true,
     flowerBoxes: true,
     props: true,
+    dormers: -1,
+    roofCovering: 'auto',
     palette: { ...PALETTES.terracotta, flowers: [...PALETTES.terracotta.flowers] },
   };
 }
@@ -243,6 +249,8 @@ export function randomParams(seed: number): HouseParams {
     shutters,
     flowerBoxes,
     props: true,
+    dormers: -1,
+    roofCovering: 'auto',
     palette,
   };
 }

@@ -364,6 +364,16 @@ export function computeLayout(p: HouseParams): HouseLayout {
   const eaveColumns = columns(p.width, cornerMargin, p.windowSpacing, pierPitch);
   const doorU = placeDoor(p, eaveColumns, cornerMargin, doorW, winW);
   let overhangEave = p.eaveOverhang;
+  // Flower boxes on one or two storeys, not on every window of the house.
+  const boxStoreys = new Set<number>(
+    floors === 1
+      ? [0]
+      : rng.fork('flower-boxes').weighted([
+          [[1], 3],
+          [[0], 2],
+          [[0, 1], 2],
+        ] as const),
+  );
 
   const storeys: StoreySpec[] = [];
   const allOpenings: Opening[] = [];
@@ -487,7 +497,7 @@ export function computeLayout(p: HouseParams): HouseLayout {
           y1: lintel.y1 + 0.02,
         },
         shutters: p.shutters && kind === 'window',
-        flowerBox: p.flowerBoxes && kind === 'window' && (s > 0 || wall.side === 'front'),
+        flowerBox: p.flowerBoxes && kind === 'window' && boxStoreys.has(s) && (s > 0 || wall.side === 'front'),
       };
       wall.openings.push(o);
       allOpenings.push(o);
@@ -558,7 +568,7 @@ export function computeLayout(p: HouseParams): HouseLayout {
   }
 
   const top = storeys[storeys.length - 1];
-  const covering = pickCovering(p.palette.roof, rng.fork('covering'));
+  const covering = p.roofCovering && p.roofCovering !== 'auto' ? p.roofCovering : pickCovering(p.palette.roof, rng.fork('covering'));
   const deckThickness = 0.12;
   const roof: RoofSpec = {
     type: 'gable',
@@ -756,33 +766,55 @@ function planDormers(
 ): DormerSpec[] {
   const pitchDeg = (roof.pitch * 180) / Math.PI;
   const chance = p.floors === 1 ? 0.65 : 0.35;
-  if (pitchDeg < 40 || !rng.chance(chance)) return [];
+  // -1 (or missing): the generator decides; 0–3: the user asked for that many.
+  const wanted = p.dormers ?? -1;
+  if (wanted === 0) return [];
+  const auto = rng.chance(chance);
+  if (wanted < 0 ? pitchDeg < 40 || !auto : pitchDeg < 32) return [];
   const tanP = Math.tan(roof.pitch);
   const cover = roof.coverThickness / Math.cos(roof.pitch);
-  const kind: 'gable' | 'shed' = rng.chance(0.65) ? 'gable' : 'shed';
+  const firstKind: 'gable' | 'shed' = rng.chance(0.65) ? 'gable' : 'shed';
   const width = round(rng.range(1.15, 1.45), 0.05);
   const winW = round(Math.min(width - 0.5, rng.range(0.6, 0.8)), 0.05);
-  const winH = round(rng.range(0.7, 0.9), 0.05);
-  const faceH = winH + 0.25 + 0.3; // sill band + window + head band
+  const firstWinH = round(rng.range(0.7, 0.9), 0.05);
   // The dormer's face stands just behind the eave wall line.
   const faceZ = top.maxZ - round(rng.range(0.35, 0.6), 0.05);
   const baseY = roofSurfaceY(roof, faceZ);
-  const eaveY = baseY + faceH;
-  const dPitch = kind === 'gable' ? rng.range(0.75, 0.95) : rng.range(0.2, 0.32);
-  const dTan = Math.tan(dPitch);
-  let ridgeY: number;
-  let backZ: number;
-  if (kind === 'gable') {
-    ridgeY = eaveY + (width / 2) * dTan;
-    // Where the main covering reaches the dormer ridge.
-    backZ = roof.halfDepth - (ridgeY - roof.eaveY - cover) / tanP;
-  } else {
-    // The shed roof rises more gently than the main roof and meets it.
-    const run = faceH / (tanP - dTan);
-    backZ = faceZ - run;
-    ridgeY = eaveY + run * dTan;
+  const pitchDraw = rng.next();
+
+  /** Heights of a dormer of this kind and window height, or null if it doesn't fit the roof. */
+  const fit = (kind: 'gable' | 'shed', winH: number) => {
+    const faceH = winH + 0.25 + 0.3; // sill band + window + head band
+    const eaveY = baseY + faceH;
+    const dPitch = kind === 'gable' ? 0.75 + 0.2 * pitchDraw : 0.2 + 0.12 * pitchDraw;
+    const dTan = Math.tan(dPitch);
+    let ridgeY: number;
+    let backZ: number;
+    if (kind === 'gable') {
+      ridgeY = eaveY + (width / 2) * dTan;
+      // Where the main covering reaches the dormer ridge.
+      backZ = roof.halfDepth - (ridgeY - roof.eaveY - cover) / tanP;
+    } else {
+      // The shed roof rises more gently than the main roof and meets it.
+      if (tanP <= dTan + 0.05) return null;
+      const run = faceH / (tanP - dTan);
+      backZ = faceZ - run;
+      ridgeY = eaveY + run * dTan;
+    }
+    if (backZ < 0.35 || faceZ - backZ < 0.5) return null;
+    return { kind, winH, eaveY, ridgeY, backZ, dPitch };
+  };
+  let f = fit(firstKind, firstWinH);
+  if (!f && wanted > 0) {
+    // Asked for explicitly: try the other kind and a smaller window before giving up.
+    const other = firstKind === 'gable' ? 'shed' : 'gable';
+    for (const [k, h] of [[other, firstWinH], [firstKind, 0.6], [other, 0.6]] as const) {
+      f = fit(k, h);
+      if (f) break;
+    }
   }
-  if (backZ < 0.35 || faceZ - backZ < 0.5) return [];
+  if (!f) return [];
+  const { kind, winH, eaveY, ridgeY, backZ, dPitch } = f;
 
   // Candidate centres: the window columns, away from gables and the chimney.
   const xs = cols
@@ -792,8 +824,11 @@ function planDormers(
   if (!xs.length) return [];
   // 1, 2 (symmetric pair) or 3 dormers.
   let chosen: number[];
-  if (xs.length >= 3 && rng.chance(0.35)) chosen = [xs[0], xs[Math.floor(xs.length / 2)], xs[xs.length - 1]];
-  else if (xs.length >= 2 && rng.chance(0.6)) chosen = [xs[0], xs[xs.length - 1]];
+  const three = xs.length >= 3 && rng.chance(0.35);
+  const two = !three && xs.length >= 2 && rng.chance(0.6); // same draws as before the override existed
+  const count = wanted > 0 ? Math.min(wanted, xs.length) : three ? 3 : two ? 2 : 1;
+  if (count >= 3) chosen = [xs[0], xs[Math.floor(xs.length / 2)], xs[xs.length - 1]];
+  else if (count === 2) chosen = [xs[0], xs[xs.length - 1]];
   else chosen = [xs.reduce((a, b) => (Math.abs(b) < Math.abs(a) ? b : a))];
   // Keep them apart.
   chosen = chosen.filter((x, i) => i === 0 || x - chosen[i - 1] > width + 0.6);

@@ -153,6 +153,30 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
       rangeParam('Pitch', 'roofPitch', 25, 62, 1, '°'),
       rangeParam('Eave overhang', 'eaveOverhang', 0.1, 0.9, 0.05, 'm'),
       rangeParam('Gable overhang', 'gableOverhang', 0.1, 0.8, 0.05, 'm'),
+      segmentedField(
+        'Dormers',
+        [
+          [-1, 'Auto'],
+          [0, 'None'],
+          [1, '1'],
+          [2, '2'],
+          [3, '3'],
+        ],
+        () => p().dormers ?? -1,
+        (v) => setParam('dormers', v),
+      ),
+      segmentedField(
+        'Covering',
+        [
+          ['auto', 'Auto'],
+          ['beaver', 'Beaver'],
+          ['fish', 'Scale'],
+          ['slate', 'Slate'],
+          ['shingle', 'Shingle'],
+        ],
+        () => p().roofCovering ?? 'auto',
+        (v) => setParam('roofCovering', v),
+      ),
       switches([['Chimney', 'chimney']]),
       segmentedField(
         'Chimney end',
