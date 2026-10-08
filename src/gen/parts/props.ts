@@ -8,10 +8,13 @@ import type { Palette } from '../params';
 import type { Rng } from '../rng';
 
 /**
- * Props: the life around the house. A path from the door steps, a lantern by
- * the door, a bench / barrels / woodpile against the walls, pots beside the
- * steps, shrubs and flowers along the base and grass tufts that blend the
- * house into the ground.
+ * Props: the life around the house. A path from the door steps that fades
+ * into the lawn, a lantern beside the door hood, pots beside the steps, a
+ * lean-to woodshed against a gable (or a plain woodpile), a bench and
+ * barrels against the walls, a climbing rose or ivy up a corner or beside
+ * the door, flower spikes, groups of shrubs and flowers along the base and
+ * grass tufts that blend the house into the ground. Small repeated detail
+ * thins out with `layout.detail` and the part's triangle budget.
  *
  * Everything is placed on a small site plan (`Site`): every item claims an
  * oriented rectangle on the ground so nothing overlaps the house, the stoop,
@@ -83,11 +86,11 @@ const DIRT = '#97815f';
 /** Gravel and earth showing in the joints between flagstones. */
 const GRAVEL = '#857a68';
 /**
- * The path's edges melt into the lawn (the viewer's ground is ≈ #7f9c52,
- * drifting lusher / drier). Prop surfaces lit like the lawn render a touch
- * brighter than the ground's own vertex colours, hence a little darker here.
+ * The path's edges melt into the lawn: the viewer's ground is ≈ #7f9c52
+ * (drifting lusher / drier); a touch lighter here because the viewer
+ * darkens ground-level mortar a little ("damp").
  */
-const PATH_EDGE = '#6c8b43';
+const PATH_EDGE = '#83a055';
 const GRASS_ROOT = '#789a4b';
 const GRASS_TIP = '#a6c463';
 /** Path stones: the palette's stone, greyed and a little darker so the path does not glare. */
@@ -769,22 +772,24 @@ function segmentFootprint(a: PathFrame, b: PathFrame, pad: number): Footprint {
 function addPathRibbon(b: PartBuilder, rng: Rng, frames: PathFrame[], base: THREE.Color): void {
   const soup = new TriSoup();
   const lanes = [-1, -0.55, 0, 0.55, 1];
-  // Lit like the lawn, these surfaces render a little brighter than the
-  // ground's own vertex colours, so the edges aim a shade darker to melt in.
   const grass = new THREE.Color(PATH_EDGE);
   const phL = rng.range(0, 10);
   const phR = rng.range(0, 10);
   const rows: Vertex[][] = frames.map((f, i) => {
     const edgeL = 1 + 0.09 * Math.sin(i * 0.8 + phL) + rng.jitter(0.05);
     const edgeR = 1 + 0.09 * Math.sin(i * 0.7 + phR) + rng.jitter(0.05);
-    const fade = smoothstep(0.62, 1, i / (frames.length - 1));
+    // Towards the far end the gravel thins to a narrow, fading strip while
+    // the stones on it scatter wider: the path dissolves into the lawn.
+    const t = i / (frames.length - 1);
+    const fade = smoothstep(0.62, 1, t);
+    const thin = 1 - 0.75 * smoothstep(0.68, 1, t);
     return lanes.map((k) => {
       const edge = Math.abs(k) === 1;
-      const lat = k * f.hw * (edge ? (k > 0 ? edgeL : edgeR) : 1);
+      const lat = k * f.hw * thin * (edge ? (k > 0 ? edgeL : edgeR) : 1);
       const p = beside(f, lat);
       const c = vary(base, rng, 0.035, 0.03, 0.005);
       if (k === 0) c.multiplyScalar(0.95); // the worn centre track
-      c.lerp(grass, Math.min(1, (edge ? 0.85 : Math.abs(k) > 0 ? 0.12 : 0) + fade * (0.75 + 0.25 * fade)));
+      c.lerp(grass, Math.min(1, (edge ? 0.85 : Math.abs(k) > 0 ? 0.12 : 0) + fade * 0.7));
       return { p: new THREE.Vector3(p.x, edge ? 0.004 : 0.008, p.z), c };
     });
   });
@@ -1664,7 +1669,11 @@ function buildWoodshed(site: Site, rng: Rng): PartBuilder | null {
     if (!tallest) return null;
     const len = base.width + 2 * base.sideOver;
     for (const wall of walls) {
-      const spans = site.freeSpans(wall, shedTop(tallest) + 0.05, 0.05).filter(([a, b]) => b - a >= len);
+      // Free stretches, kept a hand's breadth from the shutters / flower boxes of a window beside them.
+      const spans = site
+        .freeSpans(wall, shedTop(tallest) + 0.05, 0.05)
+        .map(([a, b]): [number, number] => [a > 0.06 ? a + 0.08 : a, b < wall.length - 0.06 ? b - 0.08 : b])
+        .filter(([a, b]) => b - a >= len);
       for (let i = 0; i < 6 && spans.length; i++) {
         const [a, c] = rng.pick(spans);
         // Usually tucked into a corner or against a window, the way sheds get built.
@@ -2286,41 +2295,27 @@ const EVERGREEN = ['#46703a', '#4f7a3c', '#3f6a37', '#557f40'];
 
 /**
  * Tall clipped ovoid (box or yew): an upright egg, a little fuller near the
- * top, with a few soft lumps where it has grown out since the last clip.
- * Same frame and bounds as `addShrub`.
+ * top, grown together with a slightly smaller, lighter egg beside it so the
+ * silhouette is soft and uneven without lumps sticking out. Same frame and
+ * bounds as `addShrub`.
  */
 function addOvoidShrub(b: PartBuilder, rng: Rng, m: THREE.Matrix4, width: number, height: number, depth: number): void {
   const leaf = vary(rng.pick(EVERGREEN), rng, 0.05, 0.05, 0.01);
   const halfW = width / 2 - 0.02;
   const halfD = depth / 2 - 0.02;
-  const rx = halfW / BLOB_BULGE;
+  const rx = (halfW / BLOB_BULGE) * 0.9;
   const rz = Math.min(rx, halfD / BLOB_BULGE);
   const ry = (height / 2) * 0.98;
   // Sunk a touch into the ground so it looks planted, not balanced on its tip.
-  const main: Blob = { x: 0, y: height - ry * BLOB_BULGE, z: 0, rx, ry, rz, v: 0 };
-  main.v = addShrubBlob(b, rng, m, main.x, main.y, main.z, rx, ry, rz, leaf, 2, height);
-  // A narrower foot so the egg reads as growing from the ground.
-  addShrubBlob(b, rng, m, 0, ry * 0.45, 0, rx * 0.72, ry * 0.5, rz * 0.72, vary(leaf, rng, 0.03, 0.02, 0.005).multiplyScalar(0.92), 1, height);
-  const lumps = rng.int(2, 4);
-  for (let i = 0; i < lumps; i++) {
-    const p = blobSurface(main, upperDirection(rng, -0.2), -0.3);
-    const r = rx * rng.range(0.35, 0.5);
-    const lr = Math.min(r, rz * 0.7);
-    addShrubBlob(
-      b,
-      rng,
-      m,
-      THREE.MathUtils.clamp(p.x, -halfW + r * BLOB_BULGE, halfW - r * BLOB_BULGE),
-      Math.min(p.y, height - r * 0.9 * BLOB_BULGE),
-      THREE.MathUtils.clamp(p.z, -halfD + lr * BLOB_BULGE, halfD - lr * BLOB_BULGE),
-      r,
-      r * 0.9,
-      lr,
-      vary(leaf, rng, 0.03, 0.03, 0.006).offsetHSL(0, 0, 0.02),
-      1,
-      height,
-    );
-  }
+  const side = rng.chance(0.5) ? 1 : -1;
+  addShrubBlob(b, rng, m, side * rx * 0.1, height - ry * BLOB_BULGE, 0, rx, ry, rz, leaf, 2, height);
+  // The companion egg: lower, to one side, a shade lighter.
+  const k = rng.range(0.72, 0.85);
+  const r2 = rx * k;
+  const x2 = THREE.MathUtils.clamp(-side * rx * 0.3, -halfW + r2 * BLOB_BULGE, halfW - r2 * BLOB_BULGE);
+  const y2 = height * rng.range(0.82, 0.9) - ry * k * BLOB_BULGE;
+  const z2 = THREE.MathUtils.clamp(rng.jitter(rz * 0.3), -halfD + rz * k * BLOB_BULGE, halfD - rz * k * BLOB_BULGE);
+  addShrubBlob(b, rng, m, x2, y2, z2, r2, ry * k, rz * k, vary(leaf, rng, 0.03, 0.03, 0.006).offsetHSL(0, 0, 0.02), 1, height);
 }
 
 /** Soft grey-greens for low mounds (lavender, catmint, heather). */
@@ -2682,6 +2677,32 @@ function climberCeiling(site: Site, wall: WallSpec, u0: number, u1: number): num
 
 const STEM = new THREE.CylinderGeometry(1, 1, 1, 5, 1, true);
 
+/**
+ * Leaf clump for climbers: a soft lens, round in its own x/y plane (radius
+ * 1), domed out towards +z (1) and flatter behind (-0.35). 20 triangles,
+ * like PEBBLE, but with a round silhouette seen face-on.
+ */
+const CLIMB_LEAF = (() => {
+  const n = 10;
+  const pos: number[] = [0, 0, 1, 0, 0, -0.35];
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    const r = 1 + 0.06 * Math.sin(a * 3);
+    pos.push(Math.cos(a) * r, Math.sin(a) * r, 0);
+  }
+  const idx: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const a = 2 + i;
+    const c = 2 + ((i + 1) % n);
+    idx.push(0, a, c, 1, c, a);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+})();
+
 /** A woody stem segment from a to b (wall-local), radius r. */
 function addStem(b: PartBuilder, frame: THREE.Matrix4, a: THREE.Vector3, c: THREE.Vector3, r: number, color: THREE.Color): void {
   const d = c.clone().sub(a);
@@ -2769,10 +2790,11 @@ function addClimberPlant(
       const yy = Math.min(y + rng.jitter(cell * 0.25), H - r);
       const stagger = (row % 2 ? 0.25 : -0.25) * ((2 * hw) / n);
       const u = THREE.MathUtils.clamp(c - hw + (2 * hw * (i + 0.5)) / n + stagger + rng.jitter(cell * 0.25), 0.03 + r, wall.length - 0.03 - r);
-      const w = wMin(yy - r) + rz + 0.15 * r + rng.range(0, 0.04);
+      // The lens reaches 0.35·rz behind its centre; tilted, its rim up to ~0.22·r.
+      const w = wMin(yy - r) + Math.max(0.35 * rz, 0.22 * r) + rng.range(0.005, 0.045);
       const col = vary(style.leaf, rng, 0.05, 0.04, 0.01).multiplyScalar(0.84 + 0.22 * (yy / H));
       if (rng.chance(ivy ? 0.14 : 0.08)) col.offsetHSL(0.01, 0.03, 0.05); // fresh growth
-      b.add(PEBBLE, 'foliage', col, at(u, yy, w, rng.jitter(0.15), rng.jitter(0.15), rng.range(0, Math.PI), r, r * rng.range(0.75, 0.95), rz));
+      b.add(CLIMB_LEAF, 'foliage', col, at(u, yy, w, rng.jitter(0.15), rng.jitter(0.15), rng.range(0, Math.PI), r, r * rng.range(0.78, 0.95), rz));
     }
   }
 

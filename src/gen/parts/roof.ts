@@ -14,8 +14,8 @@ import type { Rng } from '../rng';
  * The covering leaves every `layout.roof.holes` rectangle open (chimney,
  * dormers): tiles are trimmed around it (or dropped) and the ridge is split
  * where a hole reaches it. The deck stays underneath; the obstacle's owner
- * flashes the edges. Around the chimney the tiles are laid without hand-made
- * jitter so the chimney's lead can be dressed over them (`tileCourses`).
+ * flashes the edges. Around the holes the tiles are laid without hand-made
+ * jitter so lead can be dressed over them exactly (`tileCourses`).
  *
  * Slope-local coordinates (X, Y, Z) — everything on a slope is built in these:
  * - X along the ridge, from the roof's centre (world x for the front slope).
@@ -629,7 +629,7 @@ function slopeHoles(d: RoofDims, side: number): SlopeHole[] {
 
 /**
  * Courses of tiles, eave to ridge, staggered, trimmed around every roof hole.
- * Lichen grows in patches; near the chimney the tiles lie calm and exact.
+ * Lichen grows in patches; near the holes the tiles lie calm and exact.
  */
 function addTiles(b: PartBuilder, d: RoofDims, side: number, frame: THREE.Matrix4, colors: RoofColors, rng: Rng) {
   const t = d.tile;
@@ -661,8 +661,8 @@ function addTiles(b: PartBuilder, d: RoofDims, side: number, frame: THREE.Matrix
       const x0 = joints[k] + (k === 0 ? 0 : t.gap / 2);
       const x1 = joints[k + 1] - (k + 2 === joints.length ? 0 : t.gap / 2);
       const xc = (x0 + x1) / 2;
-      // Hand-laid irregularity, except where the chimney's lead lies over the
-      // tiles; the course line's waviness fades out smoothly towards it.
+      // Hand-laid irregularity, except around roof holes where flashing is
+      // dressed over the tiles; the course line's waviness fades out smoothly.
       const distCalm = calmHere.reduce((m, c) => Math.min(m, Math.max(c.x0 - x1, x0 - c.x1, 0)), Infinity);
       const quiet = distCalm === 0;
       const fade = smoothstep(distCalm, 0, 0.8);

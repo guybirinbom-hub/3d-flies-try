@@ -35,9 +35,9 @@ HouseParams ──computeLayout──▶ HouseLayout ──parts──▶ PartBu
 | `stonework` | Individual stones on the outer face of every `style === 'stone'` wall from `floorY` (ground storey) or `y0` up to `y1` / the gable slope; corner quoins. Never inside an opening `surround`. |
 | `timber` | Half-timber framing on every `style === 'timber'` wall (sill beam, top plate, corner posts, studs, braces, gable framing), plus floor bands / joist ends between storeys, especially under jetties. Never inside an opening `surround`. |
 | `openings` | Everything inside each opening's `surround`: frames, glazing bars, glass, door leaf & ironwork, lintel (wood or stone, arched heads), sill; plus shutters, flower boxes and a door canopy, which may extend outside the surround because they sit in front of everything else. |
-| `roof` | Deck (incl. soffit underside), tile courses, ridge cap, barge boards, fascia. Leaves a hole around the chimney footprint. |
+| `roof` | Deck (incl. soffit underside), tile courses, ridge cap, barge boards, fascia. Leaves every `layout.roof.holes` rectangle open (tiles trimmed, ridge split where a hole crosses it) and exports `tileCourses(layout)` / `CALM_ZONE` so the owner of a hole can dress flashing exactly over the real tile tops. |
 | `dormers` | Every dormer in `layout.roof.dormers`: face wall, cheeks, window, its own little roof, and the flashing/valleys where it meets the main roof (the roof leaves `roof.holes` open). |
-| `chimney` | The stack from `chimney.y0` to `chimney.y1`, cap, pots, and flashing where it meets the roof. |
+| `chimney` | The stack from `chimney.y0` to `chimney.y1`, cap, pots, and lead flashing (or a lime-mortar fillet on rustic stone stacks) where it meets the roof. |
 | `props` | Small things around the house: path (starting at the outer edge of `layout.stoop`), lantern by the door, bench/barrel/woodpile, potted plants, shrubs and flowers along the base. Never inside `layout.stoop`, never blocks the door. |
 
 ### Depth (w) budget — what sits in front of what

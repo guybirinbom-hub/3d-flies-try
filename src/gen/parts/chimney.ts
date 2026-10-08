@@ -10,11 +10,13 @@ import { tileCourses, type TileCourses } from './roof';
 /**
  * Chimney: a masonry stack (brick or field stone) rising through the roof,
  * crowned by a corbelled cap with clay pots or a little stone hood, and sealed
- * to the tiles with lead flashing — an apron on the downslope side, stepped
- * flashing up the sides and a back gutter on the upslope side — that follows
- * the roof surface on whichever slopes the stack touches.
+ * to the tiles with dressed lead — an apron on the downslope side, stepped
+ * flashing up the sides and a back gutter on the upslope side, lying on the
+ * actual tile courses (`tileCourses` from the roof part) on whichever slopes
+ * the stack touches — or, on some rustic stone stacks, a mortar fillet.
  *
- * The stack is axis-aligned, so everything is built directly in world space.
+ * The stack is axis-aligned, so it is built directly in world space; the
+ * sheets on the roof are built in the roof's slope-local coordinates.
  * Only the part above the tiles is detailed; below them the stack is just a
  * mortar-coloured core box (which also keeps the stack closed and shows as
  * mortar in the joints between the units).
@@ -50,7 +52,7 @@ const BRICK_REDS = ['#a5533b', '#9b4c38', '#b0613f', '#94493a', '#a95f45'];
 const TERRACOTTA = ['#a85d3e', '#b36a47', '#9c573d'];
 
 /** Masonry units the stack may hold before units get scaled up (≈44 triangles each). */
-const MAX_UNITS = 230;
+const MAX_UNITS = 200;
 
 /** Lumpiness of the units behind the lead upstands, relative to the rest. */
 const FOOT_LUMP = 0.3;
@@ -217,7 +219,8 @@ function chooseMasonry(layout: HouseLayout, spec: ChimneySpec, surfLow: number, 
           mortar: new THREE.Color(pal.mortar),
         };
   // Very tall stacks (steep roofs, back-slope chimneys) get chunkier units.
-  const units = ((spec.y1 - surfLow) / m.course) * ((2 * (spec.sx + spec.sz)) / m.unit);
+  // (Bonded corners and half units add about two pieces per course.)
+  const units = ((spec.y1 - surfLow) / m.course) * ((2 * (spec.sx + spec.sz)) / m.unit + 2);
   const scale = THREE.MathUtils.clamp(Math.sqrt(units / MAX_UNITS), 1, 1.8);
   m.course *= scale;
   m.unit *= scale;
@@ -579,7 +582,7 @@ function stoneHood(b: PartBuilder, st: Stack, capRect: Rect, rng: Rng): void {
  * on some rustic stone stacks, a trowelled mortar fillet all round.
  *
  * The roof lays the tiles near the stack exactly as `tileCourses` describes
- * them (no hand-made jitter inside `CHIMNEY_CALM_ZONE`), so the sheets follow
+ * them (no hand-made jitter inside its `CALM_ZONE`), so the sheets follow
  * the real tile tops: they lie a few millimetres above them, step down over
  * each course like dressed lead and thin out to ~3 mm at their free edges.
  */
@@ -740,11 +743,17 @@ function drapeSheet(
       top[i].push(tc.toWorld(side, X, y0 + thick(X, Z) + dy, Z));
     }
   }
+  // Only the top of the sheet and its outer rim can ever be seen: the
+  // underside lies on the tiles and inner walls are shared by two cells.
+  const nx = xs.length - 1;
+  const nz = zs.length - 1;
+  const filled = (i: number, k: number) =>
+    i >= 0 && k >= 0 && i < nx && k < nz && !inside((xs[i] + xs[i + 1]) / 2, (zs[k] + zs[k + 1]) / 2);
   const pos: number[] = [];
   const centre = new THREE.Vector3();
-  for (let i = 0; i + 1 < xs.length; i++) {
-    for (let k = 0; k + 1 < zs.length; k++) {
-      if (inside((xs[i] + xs[i + 1]) / 2, (zs[k] + zs[k + 1]) / 2)) continue;
+  for (let i = 0; i < nx; i++) {
+    for (let k = 0; k < nz; k++) {
+      if (!filled(i, k)) continue;
       const c = [
         bottom[i][k], bottom[i + 1][k], bottom[i + 1][k + 1], bottom[i][k + 1],
         top[i][k], top[i + 1][k], top[i + 1][k + 1], top[i][k + 1],
@@ -752,7 +761,12 @@ function drapeSheet(
       centre.set(0, 0, 0);
       for (const p of c) centre.add(p);
       centre.multiplyScalar(1 / 8);
-      for (const f of HEX_FACES) pushPolygon(pos, f.map((n) => c[n]), centre);
+      const faces = [HEX_FACES[1]];
+      if (!filled(i, k - 1)) faces.push(HEX_FACES[2]);
+      if (!filled(i + 1, k)) faces.push(HEX_FACES[3]);
+      if (!filled(i, k + 1)) faces.push(HEX_FACES[4]);
+      if (!filled(i - 1, k)) faces.push(HEX_FACES[5]);
+      for (const f of faces) pushPolygon(pos, f.map((n) => c[n]), centre);
     }
   }
   if (!pos.length) return;
