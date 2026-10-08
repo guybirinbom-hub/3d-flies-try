@@ -117,6 +117,14 @@ export interface StoreySpec {
   minZ: number;
   maxZ: number;
   walls: WallSpec[];
+  /** How far the storey above projects past this one on the front/back (0 = no jetty). */
+  jettyAbove: number;
+  /**
+   * Height of the jetty joist layer at the top of this storey's walls
+   * (y ∈ [y1 - joistZone, y1]), 0 when there is no jetty above. The timber
+   * part lays the joist ends there; stonework and door hoods keep clear.
+   */
+  joistZone: number;
 }
 
 export interface RoofSpec {
@@ -239,7 +247,10 @@ export function computeLayout(p: HouseParams): HouseLayout {
   const winW = round(rng.range(0.8, 1.0), 0.05);
   const winH = round(rng.range(1.05, 1.3), 0.05);
   const doorW = round(rng.range(1.0, 1.15), 0.05);
-  const doorH = round(Math.min(2.15, p.storeyHeight - 0.35), 0.05);
+  // Under a jetty the joists eat into the storey top; keep the door a little
+  // lower there so a proper hood fits above it.
+  const underJetty = floors > 1 && p.jetty > 0.005;
+  const doorH = round(Math.min(2.15, p.storeyHeight - (underJetty ? 0.65 : 0.35)), 0.05);
   const lintelH = 0.2;
   const sillH = 0.1;
   const recessWindow = -Math.min(0.14, t * 0.35);
@@ -409,7 +420,19 @@ export function computeLayout(p: HouseParams): HouseLayout {
       minZ: -halfD,
       maxZ: halfD,
       walls,
+      jettyAbove: 0,
+      joistZone: 0,
     });
+  }
+
+  // Jetty joist layers: as deep as the openings below allow (0.10–0.15 m).
+  for (let s = 0; s + 1 < storeys.length; s++) {
+    const lower = storeys[s];
+    const upper = storeys[s + 1];
+    lower.jettyAbove = Math.max(0, upper.maxZ - lower.maxZ);
+    if (lower.jettyAbove <= 0.005) continue;
+    const tops = lower.walls.flatMap((w) => w.openings.map((o) => o.surround.y1));
+    lower.joistZone = clamp(upper.y0 - Math.max(lower.y0, ...tops), 0.1, 0.15);
   }
 
   const top = storeys[storeys.length - 1];

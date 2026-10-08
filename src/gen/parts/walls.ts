@@ -21,12 +21,34 @@ export const part: PartDef = {
       b.explode = wallExplode(wall, OUTWARD.walls);
       const stone = wall.style === 'stone';
       const color = stone ? vary(pal.mortar, rng, 0.02, 0.02, 0) : vary(pal.plaster, rng, 0.015, 0.02, 0.004);
-      b.add(extrudeLocal(wallShape(wall), wall.thickness), stone ? 'mortar' : 'plaster', color, wall.frame);
+      const mat = stone ? 'mortar' : 'plaster';
+      b.add(extrudeLocal(wallShape(wall), wall.thickness), mat, color, wall.frame);
+      if (wall.storey === layout.storeys.length - 1 && !wall.isGable) {
+        b.add(eaveWedge(wall, Math.tan(layout.roof.pitch)), mat, color, wall.frame);
+      }
       out.push(b);
     }
     return out;
   },
 };
+
+/**
+ * The roof underside rises inward from the eave, so a flat wall top leaves a
+ * thin triangular void under the deck, visible in the gable faces at the
+ * corners. This wedge (wall-local, along the whole wall) fills it.
+ */
+function eaveWedge(wall: WallSpec, tanPitch: number): THREE.BufferGeometry {
+  const t = wall.thickness;
+  // Profile in (a = -w, y), extruded along u.
+  const tri = new THREE.Shape();
+  tri.moveTo(0, wall.y1);
+  tri.lineTo(t, wall.y1);
+  tri.lineTo(t, wall.y1 + t * tanPitch);
+  tri.closePath();
+  const g = new THREE.ExtrudeGeometry(tri, { depth: wall.length, bevelEnabled: false });
+  // (a, y, z) → (u = z, y, w = -a): a proper rotation, so faces stay outward.
+  return g.applyMatrix4(new THREE.Matrix4().makeBasis(new THREE.Vector3(0, 0, -1), new THREE.Vector3(0, 1, 0), new THREE.Vector3(1, 0, 0)));
+}
 
 /** Outline of the wall body in wall-local (u, y), with opening holes. */
 export function wallShape(wall: WallSpec): THREE.Shape {

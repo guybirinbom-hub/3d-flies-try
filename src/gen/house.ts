@@ -27,7 +27,10 @@ export interface PartDef {
 
 export interface HouseStats {
   triangles: number;
+  /** Triangles per part. */
   parts: Record<string, number>;
+  /** Generation time per part (build + merge), ms. */
+  partMs: Record<string, number>;
   ms: number;
 }
 
@@ -51,10 +54,11 @@ export function generateHouse(
   const root = new Rng(params.seed);
   const group = new THREE.Group();
   group.name = 'house';
-  const stats: HouseStats = { triangles: 0, parts: {}, ms: 0 };
+  const stats: HouseStats = { triangles: 0, parts: {}, partMs: {}, ms: 0 };
 
   for (const part of PARTS) {
     if (opts.parts && !opts.parts.includes(part.name)) continue;
+    const tPart = performance.now();
     let builders: PartBuilder[];
     try {
       const out = part.build({ layout, rng: root.fork(part.name) });
@@ -76,6 +80,7 @@ export function generateHouse(
       partGroup.add(g);
     }
     stats.parts[part.name] = Math.round(tris);
+    stats.partMs[part.name] = Math.round(performance.now() - tPart);
     stats.triangles += Math.round(tris);
     group.add(partGroup);
   }

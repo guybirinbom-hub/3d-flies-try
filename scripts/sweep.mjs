@@ -30,7 +30,7 @@ const server = await createServer({
   root,
   logLevel: 'error',
   cacheDir: join(tmpdir(), `vite-sweep-${process.pid}`),
-  server: { middlewareMode: true, hmr: false },
+  server: { middlewareMode: true, hmr: false, watch: null, ws: false },
   appType: 'custom',
 });
 const errors = [];
@@ -48,6 +48,7 @@ try {
 
   let worst = { tris: 0, seed: -1 };
   let totalMs = 0;
+  const partMs = {};
   const failures = [];
   for (let seed = start; seed < start + count; seed++) {
     errors.length = 0;
@@ -62,6 +63,7 @@ try {
       const h = generateHouse(p, materials, { parts });
       totalMs += Date.now() - t;
       if (h.stats.triangles > worst.tris) worst = { tris: h.stats.triangles, seed };
+      for (const [k, v] of Object.entries(h.stats.partMs)) partMs[k] = (partMs[k] ?? 0) + v;
       const box = new THREE.Box3();
       let nan = 0;
       h.group.traverse((o) => {
@@ -87,6 +89,7 @@ try {
   }
   console.log(`swept ${count} houses (seeds ${start}..${start + count - 1})${parts ? ` parts=${parts}` : ''}`);
   console.log(`avg generation ${(totalMs / count).toFixed(0)} ms, max triangles ${(worst.tris / 1000).toFixed(0)}k (seed ${worst.seed})`);
+  console.log(`avg ms per part: ${Object.entries(partMs).map(([k, v]) => `${k} ${(v / count).toFixed(0)}`).join(', ')}`);
   if (failures.length) {
     console.log(`${failures.length} seeds with problems:`);
     for (const f of failures.slice(0, 25)) {
