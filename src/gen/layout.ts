@@ -166,6 +166,56 @@ export interface RoofSpec {
    * ≈1–2 cm proud of it, the ridge cap more).
    */
   coverThickness: number;
+  /** Fascia board along the eaves: thickness, and how far it hangs below the deck underside. */
+  fasciaThickness: number;
+  fasciaDrop: number;
+  /** Dormers on the slopes (may be empty). */
+  dormers: DormerSpec[];
+  /**
+   * Plan rectangles where the roof must leave its covering open because
+   * something else (chimney, dormer) comes through. The owner of the
+   * obstacle flashes/covers the edge.
+   */
+  holes: PlanRect[];
+}
+
+/** Axis-aligned rectangle in plan (x, z). */
+export interface PlanRect {
+  x0: number;
+  x1: number;
+  z0: number;
+  z1: number;
+  /** What made the hole. */
+  kind: 'chimney' | 'dormer';
+}
+
+/**
+ * A dormer on one roof slope. Plan values are measured on the dormer's own
+ * slope (|z|); `sign` says which slope (+1 front / +Z, -1 back / -Z).
+ *
+ *   front wall: outer face at |z| = faceZ, from baseY (where it meets the
+ *   roof covering) up to eaveY, spanning x ± width/2 (outer cheek faces).
+ *   gable dormer: ridge (along z) at ridgeY, running back to |z| = backZ
+ *   where it dies into the main roof. shed dormer: one slope rising from
+ *   eaveY at the face to ridgeY at |z| = backZ.
+ */
+export interface DormerSpec {
+  id: string;
+  sign: 1 | -1;
+  x: number;
+  width: number;
+  faceZ: number;
+  baseY: number;
+  eaveY: number;
+  ridgeY: number;
+  backZ: number;
+  roof: 'gable' | 'shed';
+  /** Pitch of the dormer's own roof (rad). */
+  pitch: number;
+  /** Wall finish of the dormer face and cheeks (follows the top storey). */
+  style: WallStyle;
+  /** Window in the face: x-range (world) and y-range. */
+  window: { x0: number; x1: number; y0: number; y1: number; arched: boolean };
 }
 
 export interface ChimneySpec {
@@ -204,8 +254,20 @@ export interface HouseLayout {
   openings: Opening[];
   door: Opening;
   stoop: StoopSpec;
+  /**
+   * Zone reserved above the door for a hood/canopy (door wall local u, y;
+   * outward up to w1). Openings builds the hood inside it (or a smaller
+   * drip moulding); props keep the lantern out of it.
+   */
+  doorHood: Rect & { w1: number };
   roof: RoofSpec;
   chimney: ChimneySpec | null;
+  /**
+   * Level of detail, 0.45–1: 1 for an ordinary house, lower for very large
+   * ones. Parts thin out small repeated detail with it to keep a house
+   * around the triangle budget.
+   */
+  detail: number;
   /** World-space bounds of the whole house including roof overhang and chimney. */
   bounds: { min: Vector3; max: Vector3 };
 }
@@ -258,44 +320,84 @@ export function hitsOpening(wall: WallSpec, r: Rect, pad = 0): boolean {
 
 const SIDES: Side[] = ['front', 'right', 'back', 'left'];
 
+/** Fascia board along the eaves (the roof part builds it to these sizes). */
+const FASCIA_T = 0.045;
+const FASCIA_DROP = 0.135;
+/** Room kept above the door lintel for a hood. */
+const HOOD_ROOM = 0.45;
+/** Lintel and sill sizes shared by every opening. */
+const LINTEL_H = 0.2;
+const SILL_H = 0.1;
+/** Narrowest wall pier left between two opening surrounds. */
+const MIN_PIER = 0.35;
+
 export function computeLayout(p: HouseParams): HouseLayout {
   const rng = new Rng(p.seed).fork('layout');
   const t = p.wallThickness;
   const floors = Math.max(1, Math.min(3, Math.round(p.floors)));
+  const pitch = (p.roofPitch * Math.PI) / 180;
+  const tanP = Math.tan(pitch);
 
   // House-wide opening sizes (kept consistent across the house for coherence).
   const winW = round(rng.range(0.8, 1.0), 0.05);
   const winH = round(rng.range(1.05, 1.3), 0.05);
   const doorW = round(rng.range(1.0, 1.15), 0.05);
+  // Masonry storeys don't project, so only framed upper storeys jetty out.
+  const jetty = p.upperStyle === 'stone' ? 0 : Math.max(0, p.jetty);
   // Under a jetty the joists eat into the storey top; keep the door a little
-  // lower there so a proper hood fits above it.
-  const underJetty = floors > 1 && p.jetty > 0.005;
-  const doorH = round(Math.min(2.15, p.storeyHeight - (underJetty ? 0.65 : 0.35)), 0.05);
-  const lintelH = 0.2;
-  const sillH = 0.1;
+  // lower there so a hood fits above it (but never below 1.9 m).
+  const underJetty = floors > 1 && jetty > 0.005;
+  const doorH = round(
+    Math.min(clamp(p.storeyHeight - (underJetty ? 0.75 : 0.6), 1.9, 2.05), p.storeyHeight - 0.45),
+    0.05,
+  );
   const recessWindow = -Math.min(0.14, t * 0.35);
   const recessDoor = -Math.min(0.16, t * 0.4);
+
+  // Window columns along the front/back walls are shared by all storeys so
+  // upper windows line up with the ones below. Columns keep a pier between
+  // lintels (and room for open shutters).
+  const cornerMargin = t + 0.75;
+  const pierPitch = winW + 0.32 + MIN_PIER + (p.shutters ? winW * 0.55 : 0);
+  const eaveColumns = columns(p.width, cornerMargin, p.windowSpacing, pierPitch);
+  const doorU = placeDoor(p, eaveColumns, cornerMargin, doorW, winW);
+  let overhangEave = p.eaveOverhang;
 
   const storeys: StoreySpec[] = [];
   const allOpenings: Opening[] = [];
   let door: Opening | null = null;
 
-  // Window columns along the front/back walls are shared by all storeys so
-  // upper windows line up with the ones below.
-  const cornerMargin = t + 0.75;
-  const eaveColumns = columns(p.width, cornerMargin, p.windowSpacing);
-  const doorHalfRange = Math.max(0, p.width / 2 - cornerMargin - doorW / 2);
-  const doorU = p.width / 2 + clamp(p.doorOffset, -1, 1) * doorHalfRange;
-
   for (let s = 0; s < floors; s++) {
-    const jet = p.jetty * s;
+    const style = s === 0 ? p.groundStyle : p.upperStyle;
+    const jet = jetty * s;
     const halfW = p.width / 2;
     const halfD = p.depth / 2 + jet;
     const y0 = s === 0 ? 0 : storeys[s - 1].y1;
     const floorY = s === 0 ? p.plinthHeight : y0;
-    const y1 = floorY + p.storeyHeight;
-    const style = s === 0 ? p.groundStyle : p.upperStyle;
     const top = s === floors - 1;
+    // Upper windows a little shorter than the ground floor's, the top floor's shortest.
+    const winHs = round(winH * (s === 0 ? 1 : top ? 0.9 : 0.95), 0.05);
+    const winSill = floorY + (s === 0 ? 0.85 : 0.8);
+    let y1 = floorY + p.storeyHeight;
+
+    if (top) {
+      // Knee wall: the eave edge drops by overhang·tan(pitch) plus the
+      // fascia, and must stay clear above the top storey's window lintels
+      // (and on a cottage above the door and its hood). Raise the walls by
+      // the shortfall; if that would be silly, shorten the overhang too.
+      const sinP = Math.sin(pitch);
+      const cosP = Math.cos(pitch);
+      const fasciaBelow = FASCIA_T * sinP + FASCIA_DROP * cosP;
+      let need = winSill + winHs + LINTEL_H + 0.08;
+      if (s === 0) need = Math.max(need, floorY + doorH + LINTEL_H + HOOD_ROOM, 2.1);
+      let knee = Math.max(0, need + overhangEave * tanP + fasciaBelow - y1);
+      const maxKnee = 0.8;
+      if (knee > maxKnee) {
+        knee = maxKnee;
+        overhangEave = clamp((y1 + knee - need - fasciaBelow) / tanP, 0.1, overhangEave);
+      }
+      y1 = round(y1 + knee, 0.01);
+    }
 
     const corners = [
       { x: -halfW, z: halfD }, // front-left
@@ -340,16 +442,14 @@ export function computeLayout(p: HouseParams): HouseLayout {
       };
     });
 
-    const tan = Math.tan((p.roofPitch * Math.PI) / 180);
     if (top) {
       for (const w of walls) {
         if (!w.isGable) continue;
-        w.gable = { apexU: w.length / 2, apexY: y1 + (w.length / 2) * tan, eaveY: y1 };
+        w.gable = { apexU: w.length / 2, apexY: y1 + (w.length / 2) * tanP, eaveY: y1 };
       }
     }
 
     // --- openings -------------------------------------------------------
-    const winSill = floorY + (s === 0 ? 0.85 : 0.8);
     const makeOpening = (
       wall: WallSpec,
       kind: OpeningKind,
@@ -363,8 +463,8 @@ export function computeLayout(p: HouseParams): HouseLayout {
       const u1 = uc + w / 2;
       const y1o = y0o + h;
       const isDoor = kind === 'door';
-      const lintel: Rect = { u0: u0 - 0.16, u1: u1 + 0.16, y0: y1o, y1: y1o + lintelH };
-      const sill: Rect | null = isDoor ? null : { u0: u0 - 0.1, u1: u1 + 0.1, y0: y0o - sillH, y1: y0o };
+      const lintel: Rect = { u0: u0 - 0.16, u1: u1 + 0.16, y0: y1o, y1: y1o + LINTEL_H };
+      const sill: Rect | null = isDoor ? null : { u0: u0 - 0.1, u1: u1 + 0.1, y0: y0o - SILL_H, y1: y0o };
       const o: Opening = {
         id: `${wall.id}-${kind}${wall.openings.length}`,
         kind,
@@ -396,36 +496,36 @@ export function computeLayout(p: HouseParams): HouseLayout {
       if (!wall.isGable) {
         // Front / back: shared columns. Ground-floor front gets the door.
         const hasDoor = s === 0 && wall.side === 'front';
+        if (hasDoor) door = makeOpening(wall, 'door', doorU, doorW, floorY, doorH, p.archedDoor);
+        // The back wall is walked in the opposite direction; mirror columns
+        // so windows line up front-to-back too.
+        let cols = eaveColumns.map((uc) => (wall.side === 'back' ? wall.length - uc : uc));
         if (hasDoor) {
-          door = makeOpening(wall, 'door', doorU, doorW, floorY, doorH, p.archedDoor);
+          const clearance = (doorW + winW) / 2 + 0.32 + MIN_PIER;
+          cols = cols.filter((u) => Math.abs(u - doorU) >= clearance);
+        } else if (wall.side === 'back' && s === 0) {
+          cols = pattern(cols, wall.length, rng.weighted([['full', 3], ['sparse', 2]] as const));
         }
-        for (const uc of eaveColumns) {
-          // The back wall is walked in the opposite direction; mirror columns
-          // so windows line up front-to-back too.
-          const u = wall.side === 'back' ? wall.length - uc : uc;
-          const clearance = (doorW + winW) / 2 + 0.45;
-          if (hasDoor && Math.abs(u - doorU) < clearance) continue;
-          if (wall.side === 'back' && s === 0 && rng.chance(0.25)) continue;
-          makeOpening(wall, 'window', u, winW, winSill, winH, false);
-        }
+        for (const u of cols) makeOpening(wall, 'window', u, winW, winSill, winHs, false);
       } else {
-        // Gable walls: fewer windows, sometimes none on the ground floor.
-        const cols = columns(wall.length, cornerMargin, p.windowSpacing * 1.1);
+        // Gable walls: their own columns, a deliberate pattern per storey.
+        const cols = columns(wall.length, cornerMargin, p.windowSpacing * 1.1, pierPitch * 0.95);
         const chimneyWall = p.chimney && wall.side === p.chimneySide;
-        for (const uc of cols) {
-          if (chimneyWall && s === 0 && rng.chance(0.5)) continue;
-          if (s === 0 && rng.chance(0.2)) continue;
-          makeOpening(wall, 'window', uc, winW * 0.9, winSill, winH * 0.92, false);
+        const choice =
+          s === 0
+            ? rng.weighted([
+                ['full', 3],
+                ['centre', 2],
+                ['blank', chimneyWall || style === 'stone' ? 1.5 : 0.3],
+              ] as const)
+            : rng.weighted([
+                ['full', 4],
+                ['centre', 1],
+              ] as const);
+        for (const u of pattern(cols, wall.length, choice)) {
+          makeOpening(wall, 'window', u, winW * 0.9, winSill, winHs * 0.92, false);
         }
-        if (top && wall.gable) {
-          // Attic window in the gable triangle if there is room.
-          const triH = wall.gable.apexY - wall.gable.eaveY;
-          const aw = 0.6;
-          const ah = Math.min(0.9, triH * 0.38);
-          const ay0 = wall.gable.eaveY + Math.max(0.35, triH * 0.18);
-          const fits = ah >= 0.45 && ay0 + ah + lintelH + 0.15 < gableTopAt(wall, wall.length / 2 - aw / 2 - 0.2);
-          if (fits) makeOpening(wall, 'attic', wall.length / 2, aw, ay0, ah, rng.chance(0.5));
-        }
+        if (top && wall.gable) atticWindows(wall, rng, makeOpening);
       }
     }
 
@@ -456,7 +556,6 @@ export function computeLayout(p: HouseParams): HouseLayout {
   }
 
   const top = storeys[storeys.length - 1];
-  const pitch = (p.roofPitch * Math.PI) / 180;
   const covering = pickCovering(p.palette.roof, rng.fork('covering'));
   const deckThickness = 0.12;
   const roof: RoofSpec = {
@@ -465,13 +564,17 @@ export function computeLayout(p: HouseParams): HouseLayout {
     pitch,
     eaveY: top.y1,
     halfDepth: top.maxZ,
-    ridgeY: top.y1 + top.maxZ * Math.tan(pitch),
+    ridgeY: top.y1 + top.maxZ * tanP,
     minX: top.minX,
     maxX: top.maxX,
-    overhangEave: p.eaveOverhang,
+    overhangEave,
     overhangGable: p.gableOverhang,
     deckThickness,
     coverThickness: deckThickness + COVER_TOP[covering],
+    fasciaThickness: FASCIA_T,
+    fasciaDrop: FASCIA_DROP,
+    dormers: [],
+    holes: [],
   };
 
   let chimney: ChimneySpec | null = null;
@@ -484,7 +587,7 @@ export function computeLayout(p: HouseParams): HouseLayout {
     // ridge the stack must still clear it, so keep the drop between the stack's
     // foot and the ridge modest (≤ 1.2 m) or it turns into a tower.
     const onRidge = rng.chance(0.55) || pitch > (55 * Math.PI) / 180;
-    const maxOff = Math.max(0, 1.2 / Math.tan(pitch) - sz / 2);
+    const maxOff = Math.max(0, 1.2 / tanP - sz / 2);
     const z = onRidge ? 0 : -round(Math.min(rng.range(0.25, 0.45) * top.maxZ, maxOff), 0.05);
     const surfaceAtHighSide = roofSurfaceY(roof, Math.max(0, Math.abs(z) - sz / 2));
     chimney = {
@@ -495,10 +598,18 @@ export function computeLayout(p: HouseParams): HouseLayout {
       y0: top.y1 - 0.5,
       y1: Math.max(surfaceAtHighSide + rng.range(0.7, 1.1), roofSurfaceY(roof, 0) + 0.45),
     };
+    roof.holes.push({ x0: x - sx / 2, x1: x + sx / 2, z0: z - sz / 2, z1: z + sz / 2, kind: 'chimney' });
+  }
+
+  roof.dormers = planDormers(p, roof, top, eaveColumns, chimney, rng.fork('dormers'));
+  for (const d of roof.dormers) {
+    const za = d.sign * d.backZ;
+    const zb = d.sign * d.faceZ;
+    roof.holes.push({ x0: d.x - d.width / 2, x1: d.x + d.width / 2, z0: Math.min(za, zb), z1: Math.max(za, zb), kind: 'dormer' });
   }
 
   const walls = storeys.flatMap((s) => s.walls);
-  const maxZ = Math.max(...storeys.map((s) => s.maxZ)) + p.eaveOverhang;
+  const maxZ = Math.max(...storeys.map((s) => s.maxZ)) + overhangEave;
   const maxY = Math.max(roofSurfaceY(roof, 0) + 0.15, chimney ? chimney.y1 + 0.2 : 0);
   const bounds = {
     min: new Vector3(top.minX - p.gableOverhang, 0, -maxZ),
@@ -517,7 +628,196 @@ export function computeLayout(p: HouseParams): HouseLayout {
     steps,
     topY: storeys[0].floorY,
   };
-  return { params: p, storeys, walls, openings: allOpenings, door: d, stoop, roof, chimney, bounds };
+  const doorHood = hoodZone(d, storeys[0], storeys[1]?.style ?? null, storeys.length === 1 ? roof : null);
+
+  // Level of detail from the amount of wall: ~1 up to an ordinary 2-storey house.
+  let wallArea = 0;
+  for (const w of walls) {
+    wallArea += w.length * (w.y1 - w.y0);
+    if (w.gable) wallArea += (w.length * (w.gable.apexY - w.gable.eaveY)) / 2;
+  }
+  const detail = clamp(220 / wallArea, 0.45, 1);
+
+  return { params: p, storeys, walls, openings: allOpenings, door: d, stoop, doorHood, roof, chimney, detail, bounds };
+}
+
+type WallPattern = 'full' | 'sparse' | 'centre' | 'blank';
+
+/**
+ * Which window columns a wall keeps. Never leaves a lone window off-centre:
+ * 'sparse' keeps the outer pair (and the middle one), 'centre' a single
+ * centred window.
+ */
+function pattern(cols: number[], length: number, kind: WallPattern): number[] {
+  if (kind === 'blank') return [];
+  if (kind === 'centre' || cols.length === 1) return cols.length ? [length / 2] : [];
+  if (kind === 'sparse' && cols.length >= 3) {
+    const keep = [cols[0], cols[cols.length - 1]];
+    if (cols.length % 2 === 1) keep.splice(1, 0, cols[(cols.length - 1) / 2]);
+    return keep;
+  }
+  return cols;
+}
+
+/**
+ * Door position: as close to the requested offset as possible, but either on
+ * a window column (so the windows above line up with it) or centred between
+ * two columns that leave room for it.
+ */
+function placeDoor(p: HouseParams, cols: number[], margin: number, doorW: number, winW: number): number {
+  const lo = margin + doorW / 2;
+  const hi = p.width - margin - doorW / 2;
+  const half = Math.max(0, (hi - lo) / 2);
+  const wanted = p.width / 2 + clamp(p.doorOffset, -1, 1) * half;
+  const candidates = [...cols];
+  for (let i = 0; i + 1 < cols.length; i++) {
+    if (cols[i + 1] - cols[i] >= doorW + winW + 2 * (0.32 + MIN_PIER)) candidates.push((cols[i] + cols[i + 1]) / 2);
+  }
+  const ok = candidates.filter((u) => u >= lo - 1e-6 && u <= hi + 1e-6);
+  if (!ok.length) return clamp(wanted, Math.min(lo, p.width / 2), Math.max(hi, p.width / 2));
+  return ok.reduce((best, u) => (Math.abs(u - wanted) < Math.abs(best - wanted) ? u : best));
+}
+
+/**
+ * Windows in the gable triangle above the top storey: one attic window,
+ * scaled with the triangle; tall gables get a loft pair below it.
+ */
+function atticWindows(
+  wall: WallSpec,
+  rng: Rng,
+  make: (wall: WallSpec, kind: OpeningKind, uc: number, w: number, y0: number, h: number, arched: boolean) => Opening,
+): void {
+  const g = wall.gable!;
+  const triH = g.apexY - g.eaveY;
+  const mid = wall.length / 2;
+  const fits = (uc: number, w: number, y0: number, h: number) =>
+    y0 + h + LINTEL_H + 0.15 < gableTopAt(wall, uc - w / 2 - 0.2) &&
+    y0 + h + LINTEL_H + 0.15 < gableTopAt(wall, uc + w / 2 + 0.2) &&
+    uc - w / 2 - 0.2 > wall.u0 &&
+    uc + w / 2 + 0.2 < wall.u1;
+  let topY0 = g.eaveY + Math.max(0.35, triH * 0.18);
+  if (triH > 3.5 && rng.chance(0.6)) {
+    // Loft pair low in the gable, a smaller window up near the apex.
+    const lw = 0.6;
+    const lh = Math.min(0.95, triH * 0.22);
+    const ly0 = g.eaveY + 0.4;
+    const off = clamp(triH * 0.32, 0.75, 1.2);
+    if (fits(mid - off, lw, ly0, lh) && fits(mid + off, lw, ly0, lh)) {
+      make(wall, 'attic', mid - off, lw, ly0, lh, false);
+      make(wall, 'attic', mid + off, lw, ly0, lh, false);
+      topY0 = ly0 + lh + LINTEL_H + SILL_H + 0.35;
+    }
+  }
+  const aw = clamp(0.5 + triH * 0.06, 0.55, 0.8);
+  const ah = Math.min(1.0, triH * 0.3, g.apexY - topY0 - LINTEL_H - 0.6);
+  if (ah >= 0.45 && fits(mid, aw, topY0, ah)) make(wall, 'attic', mid, aw, topY0, ah, rng.chance(0.5));
+}
+
+/** Room above the door for a hood: under the joists/band of the storey above, or the eave. */
+function hoodZone(
+  door: Opening,
+  ground: StoreySpec,
+  upperStyle: WallStyle | null,
+  roofOverDoor: RoofSpec | null,
+): Rect & { w1: number } {
+  // Joist ends under a jetty; a timber top plate / storey band otherwise.
+  const band = ground.style === 'timber' || (ground.style === 'plaster' && upperStyle === 'stone') ? 0.23 : 0.03;
+  let ceiling = ground.y1 - (ground.joistZone > 0 ? ground.joistZone + 0.03 : band);
+  if (roofOverDoor) {
+    const r = roofOverDoor;
+    // Under the eave (rafter tails, soffit) as far out as the hood reaches or the eave ends.
+    const out = Math.min(0.6, r.overhangEave);
+    ceiling = Math.min(ceiling, r.eaveY - out * Math.tan(r.pitch) - r.fasciaDrop * Math.cos(r.pitch));
+  }
+  return {
+    u0: door.lintel.u0 - 0.12,
+    u1: door.lintel.u1 + 0.12,
+    y0: door.lintel.y1,
+    y1: Math.max(door.lintel.y1, ceiling),
+    w1: 0.75,
+  };
+}
+
+/**
+ * Dormers: on steep enough roofs, sometimes, lined up with the window
+ * columns below and clear of the chimney and the gable ends.
+ */
+function planDormers(
+  p: HouseParams,
+  roof: RoofSpec,
+  top: StoreySpec,
+  cols: number[],
+  chimney: ChimneySpec | null,
+  rng: Rng,
+): DormerSpec[] {
+  const pitchDeg = (roof.pitch * 180) / Math.PI;
+  const chance = p.floors === 1 ? 0.65 : 0.35;
+  if (pitchDeg < 40 || !rng.chance(chance)) return [];
+  const tanP = Math.tan(roof.pitch);
+  const cover = roof.coverThickness / Math.cos(roof.pitch);
+  const kind: 'gable' | 'shed' = rng.chance(0.65) ? 'gable' : 'shed';
+  const width = round(rng.range(1.15, 1.45), 0.05);
+  const winW = round(Math.min(width - 0.5, rng.range(0.6, 0.8)), 0.05);
+  const winH = round(rng.range(0.7, 0.9), 0.05);
+  const faceH = winH + 0.25 + 0.3; // sill band + window + head band
+  // The dormer's face stands just behind the eave wall line.
+  const faceZ = top.maxZ - round(rng.range(0.35, 0.6), 0.05);
+  const baseY = roofSurfaceY(roof, faceZ);
+  const eaveY = baseY + faceH;
+  const dPitch = kind === 'gable' ? rng.range(0.75, 0.95) : rng.range(0.2, 0.32);
+  const dTan = Math.tan(dPitch);
+  let ridgeY: number;
+  let backZ: number;
+  if (kind === 'gable') {
+    ridgeY = eaveY + (width / 2) * dTan;
+    // Where the main covering reaches the dormer ridge.
+    backZ = roof.halfDepth - (ridgeY - roof.eaveY - cover) / tanP;
+  } else {
+    // The shed roof rises more gently than the main roof and meets it.
+    const run = faceH / (tanP - dTan);
+    backZ = faceZ - run;
+    ridgeY = eaveY + run * dTan;
+  }
+  if (backZ < 0.35 || faceZ - backZ < 0.5) return [];
+
+  // Candidate centres: the window columns, away from gables and the chimney.
+  const xs = cols
+    .map((u) => u - p.width / 2)
+    .filter((x) => x - width / 2 > roof.minX + 0.8 && x + width / 2 < roof.maxX - 0.8)
+    .filter((x) => !chimney || Math.abs(x - chimney.x) > chimney.sx / 2 + width / 2 + 0.5);
+  if (!xs.length) return [];
+  // 1, 2 (symmetric pair) or 3 dormers.
+  let chosen: number[];
+  if (xs.length >= 3 && rng.chance(0.35)) chosen = [xs[0], xs[Math.floor(xs.length / 2)], xs[xs.length - 1]];
+  else if (xs.length >= 2 && rng.chance(0.6)) chosen = [xs[0], xs[xs.length - 1]];
+  else chosen = [xs.reduce((a, b) => (Math.abs(b) < Math.abs(a) ? b : a))];
+  // Keep them apart.
+  chosen = chosen.filter((x, i) => i === 0 || x - chosen[i - 1] > width + 0.6);
+
+  const sides: (1 | -1)[] = rng.chance(0.3) ? [1, -1] : [1];
+  const out: DormerSpec[] = [];
+  for (const sign of sides) {
+    for (const x of chosen) {
+      if (sign === -1 && chimney && chimney.z < 0 && Math.abs(x - chimney.x) < chimney.sx / 2 + width / 2 + 0.5) continue;
+      const wy0 = baseY + 0.25;
+      out.push({
+        id: `dormer-${sign > 0 ? 'f' : 'b'}${out.length}`,
+        sign,
+        x,
+        width,
+        faceZ,
+        baseY,
+        eaveY,
+        ridgeY,
+        backZ,
+        roof: kind,
+        pitch: dPitch,
+        style: top.style,
+        window: { x0: x - winW / 2, x1: x + winW / 2, y0: wy0, y1: wy0 + winH, arched: kind === 'gable' && rng.chance(0.3) },
+      });
+    }
+  }
+  return out;
 }
 
 /** A covering that suits the palette's roof colour (classified as authored, in sRGB). */
@@ -532,12 +832,17 @@ function pickCovering(roofColor: string, rng: Rng): RoofCovering {
   return rng.weighted(weights);
 }
 
-/** Evenly spaced centres along a wall, keeping `margin` clear at both ends. */
-function columns(length: number, margin: number, spacing: number): number[] {
+/**
+ * Evenly spaced centres along a wall, keeping `margin` clear at both ends,
+ * about `spacing` apart but never closer than `minPitch` (lintels, piers,
+ * open shutters need the room).
+ */
+function columns(length: number, margin: number, spacing: number, minPitch: number): number[] {
   const avail = length - 2 * margin;
   if (avail < 0) return length > 2.2 ? [length / 2] : [];
-  const n = Math.max(1, Math.round(avail / spacing) + 1);
-  if (n === 1) return [length / 2];
+  let n = Math.floor(avail / spacing + 0.2) + 1;
+  while (n > 1 && avail / (n - 1) < minPitch) n--;
+  if (n <= 1) return [length / 2];
   return Array.from({ length: n }, (_, i) => margin + (avail * i) / (n - 1));
 }
 

@@ -14,6 +14,7 @@ export const PART_ORDER = [
   'timber',
   'openings',
   'roof',
+  'dormers',
   'chimney',
   'props',
 ] as const;

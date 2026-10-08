@@ -36,6 +36,7 @@ HouseParams ──computeLayout──▶ HouseLayout ──parts──▶ PartBu
 | `timber` | Half-timber framing on every `style === 'timber'` wall (sill beam, top plate, corner posts, studs, braces, gable framing), plus floor bands / joist ends between storeys, especially under jetties. Never inside an opening `surround`. |
 | `openings` | Everything inside each opening's `surround`: frames, glazing bars, glass, door leaf & ironwork, lintel (wood or stone, arched heads), sill; plus shutters, flower boxes and a door canopy, which may extend outside the surround because they sit in front of everything else. |
 | `roof` | Deck (incl. soffit underside), tile courses, ridge cap, barge boards, fascia. Leaves a hole around the chimney footprint. |
+| `dormers` | Every dormer in `layout.roof.dormers`: face wall, cheeks, window, its own little roof, and the flashing/valleys where it meets the main roof (the roof leaves `roof.holes` open). |
 | `chimney` | The stack from `chimney.y0` to `chimney.y1`, cap, pots, and flashing where it meets the roof. |
 | `props` | Small things around the house: path (starting at the outer edge of `layout.stoop`), lantern by the door, bench/barrel/woodpile, potted plants, shrubs and flowers along the base. Never inside `layout.stoop`, never blocks the door. |
 
@@ -61,6 +62,15 @@ wall body (corner blocks, corner posts, plinth bond stones, never past
 `w = -thickness + 0.05`), and small fixings may pass into the wall face to
 attach anything that would otherwise float (door-hood deck and brackets,
 flower-box brackets, shutter pintles, lantern back plates).
+
+### Layout facts every part can rely on
+
+- `layout.roof.holes`: plan rectangles (chimney, dormers) where the roof leaves its covering open; the obstacle's owner flashes the edges.
+- `layout.roof.dormers`: dormer specs (face line `faceZ`, `baseY`/`eaveY`/`ridgeY`, `backZ`, roof kind, window rect, wall style).
+- `layout.roof.fasciaThickness` / `fasciaDrop`: the fascia sizes the layout used to keep the eave edge clear of the top storey's lintels (via a knee wall, `top.y1` above `floorY + storeyHeight`).
+- `layout.doorHood`: the zone above the door (door-wall local u/y, outward to `w1`) reserved for a hood; props keep out of it.
+- `layout.detail` (0.45–1): level of detail; parts thin out small repeated detail on very large houses to stay near the triangle budget.
+- Jetties only happen under non-stone upper storeys.
 
 ### Storey boundaries and jetties
 
