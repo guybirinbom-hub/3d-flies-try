@@ -70,6 +70,8 @@ flower-box brackets, shutter pintles, lantern back plates).
 - `layout.roof.fasciaThickness` / `fasciaDrop`: the fascia sizes the layout used to keep the eave edge clear of the top storey's lintels (via a knee wall, `top.y1` above `floorY + storeyHeight`).
 - `layout.doorHood`: the zone above the door (door-wall local u/y, outward to `w1`) reserved for a hood; props keep out of it.
 - `layout.detail` (0.45–1): level of detail; parts thin out small repeated detail on very large houses to stay near the triangle budget.
+- `layout.glazing` ('cross' | 'six'): one window glazing pattern for the whole house (wall and dormer windows).
+- `params.dormers` (-1 auto, 0–3) and `params.roofCovering` ('auto' or a covering) let the user override those decisions.
 - Jetties only happen under non-stone upper storeys.
 
 ### Storey boundaries and jetties

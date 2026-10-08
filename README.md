@@ -18,11 +18,12 @@ npm run dev          # interactive viewer at http://localhost:5173
 
 In the viewer: **New house** rolls a new seed; the panel changes footprint,
 storeys, wall styles (stone / plaster / timber per floor), jetty, roof pitch
-and overhangs, chimney, shutters, flower boxes, palette and garden props. The
-**Exploded view** slider (and **Play assembly**) pulls the generated layers
-apart, so you can see how the house is put together; **Layers** hides parts;
-**Village of nine** shows nine generated houses around a green;
-**Download .glb** exports the current house.
+and overhangs, dormers, roof covering, chimney, shutters, flower boxes,
+palette and garden props. The **Exploded view** slider (and **Play
+assembly**) pulls the generated layers apart, so you can see how the house is
+put together; **Layers** hides parts; **Village of nine** places nine
+generated houses around a green with a well, lanes and trees;
+**Download .glb** exports the current house (or village).
 
 ## How it works
 
@@ -33,10 +34,13 @@ HouseParams ──computeLayout──▶ HouseLayout ──8 parts──▶ geom
 
 1. **Params** (`src/gen/params.ts`): size, storeys, styles, roof, details, palette.
    `randomParams(seed)` produces a coherent random house.
-2. **Layout** (`src/gen/layout.ts`): pure numbers. Storeys and their walls,
-   every opening with its lintel/sill/surround zone, jetty joist zones, roof
-   geometry and covering, chimney, door steps. All parts read this and only
-   this, so they always agree on where things are.
+2. **Layout** (`src/gen/layout.ts`): pure numbers, and the architectural
+   decisions. Storeys and their walls (with a knee wall when the eave would
+   otherwise hang over the windows), window columns and door placement,
+   every opening with its lintel/sill/surround zone, jetty joist zones, the
+   door-hood zone, roof geometry, covering, holes and dormers, chimney, door
+   steps, level of detail. All parts read this and only this, so they always
+   agree on where things are.
 3. **Parts** (`src/gen/parts/*.ts`), each an independent generator:
 
    | Part | Generates |
@@ -46,9 +50,10 @@ HouseParams ──computeLayout──▶ HouseLayout ──8 parts──▶ geom
    | `stonework` | hand-laid field stone in irregular courses, interlocking quoins |
    | `timber` | half-timber framing (posts, rails, braces, gable framing), storey bands, jetty joists and brackets |
    | `openings` | windows, doors, lintels/arches, sills, shutters, flower boxes, door hood |
-   | `roof` | deck and soffit, beaver-tail / fish-scale / slate / shingle courses, ridge, barge boards, fascia, finials |
-   | `chimney` | brick or stone stack, cap and pots, lead flashing following the roof |
-   | `props` | path, wall lantern, pots, woodpile, bench, barrels, planting, grass |
+   | `roof` | deck and soffit, beaver-tail / fish-scale / slate / shingle courses, lichen, ridge, barge boards, fascia, finials; leaves holes for chimney and dormers |
+   | `dormers` | gabled and shed dormers: face, cheeks, window, little tiled roof, lead valleys and flashing |
+   | `chimney` | brick or stone stack, cap and pots, lead flashing laid over the actual tile courses |
+   | `props` | path, wall lantern, pots, woodpile or lean-to woodshed, bench, barrels, planting, climbers, grass |
 
 4. **Builder** (`src/gen/builder.ts`): pieces are merged into one mesh per
    material per wall/slope, so a house is a few dozen draw calls.
