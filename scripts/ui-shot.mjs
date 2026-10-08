@@ -23,7 +23,7 @@ const server = await createServer({
   root,
   logLevel: 'error',
   cacheDir: join(tmpdir(), `vite-ui-${process.pid}`),
-  server: { port: 0, host: '127.0.0.1' },
+  server: { port: 0, host: '127.0.0.1', hmr: false, watch: null },
 });
 await server.listen();
 const base = `http://127.0.0.1:${server.httpServer.address().port}/?${query}`;

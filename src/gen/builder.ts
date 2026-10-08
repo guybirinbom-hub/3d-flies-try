@@ -58,17 +58,24 @@ export class PartBuilder {
     if (paint) {
       const p = new THREE.Vector3();
       const nn = new THREE.Vector3();
+      const out = new THREE.Color();
       const pos = g.attributes.position;
       const nor = g.attributes.normal;
       for (let i = 0; i < n; i++) {
         p.fromBufferAttribute(pos, i);
         nn.fromBufferAttribute(nor, i);
-        const out = c.clone();
+        out.copy(c);
         paint(p, nn, out);
-        colors.set([out.r, out.g, out.b], i * 3);
+        colors[i * 3] = out.r;
+        colors[i * 3 + 1] = out.g;
+        colors[i * 3 + 2] = out.b;
       }
     } else {
-      for (let i = 0; i < n; i++) colors.set([c.r, c.g, c.b], i * 3);
+      for (let i = 0; i < n; i++) {
+        colors[i * 3] = c.r;
+        colors[i * 3 + 1] = c.g;
+        colors[i * 3 + 2] = c.b;
+      }
     }
     g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     let list = this.chunks.get(mat);

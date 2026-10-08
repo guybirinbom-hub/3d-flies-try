@@ -41,7 +41,9 @@ const server = await createServer({
   root,
   logLevel: 'error',
   cacheDir: join(tmpdir(), `vite-shoot-${process.pid}`),
-  server: { port: 0, host: '127.0.0.1' },
+  // A fresh server per run: no file watching / HMR, so edits made by other
+  // processes mid-run can't trigger full reloads that blank the page.
+  server: { port: 0, host: '127.0.0.1', hmr: false, watch: null },
 });
 await server.listen();
 const addr = server.httpServer.address();
