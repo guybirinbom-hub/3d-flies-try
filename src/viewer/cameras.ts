@@ -1,0 +1,60 @@
+import * as THREE from 'three';
+import type { HouseLayout } from '../gen/layout';
+import { wallPoint } from '../gen/layout';
+
+export const CAMERA_PRESETS = ['iso', 'iso2', 'front', 'back', 'left', 'right', 'top', 'door', 'eave', 'low'] as const;
+export type CameraPreset = (typeof CAMERA_PRESETS)[number];
+
+/** Position + target for a named viewpoint around a house. */
+export function cameraFor(
+  preset: CameraPreset,
+  layout: HouseLayout,
+  fovDeg: number,
+  aspect: number,
+): { position: THREE.Vector3; target: THREE.Vector3 } {
+  const { min, max } = layout.bounds;
+  const size = max.clone().sub(min);
+  const target = new THREE.Vector3(0, max.y * 0.42, 0);
+  const radius = Math.max(size.x, size.y, size.z) * 0.62;
+  const fov = (fovDeg * Math.PI) / 180;
+  const fitFov = aspect < 1 ? 2 * Math.atan(Math.tan(fov / 2) * aspect) : fov;
+  const dist = (radius / Math.sin(fitFov / 2)) * 1.0;
+
+  const from = (dx: number, dy: number, dz: number, d = dist) =>
+    target.clone().add(new THREE.Vector3(dx, dy, dz).normalize().multiplyScalar(d));
+
+  switch (preset) {
+    case 'iso':
+      return { position: from(0.95, 0.5, 1.15), target };
+    case 'iso2':
+      return { position: from(-1.05, 0.45, 1.0), target };
+    case 'front':
+      return { position: from(0, 0.22, 1), target };
+    case 'back':
+      return { position: from(-0.6, 0.4, -1), target };
+    case 'left':
+      return { position: from(-1, 0.25, 0.12), target };
+    case 'right':
+      return { position: from(1, 0.25, 0.12), target };
+    case 'top':
+      return { position: from(0.02, 1, 0.35), target };
+    case 'low':
+      return { position: from(0.7, 0.08, 1.0, dist * 0.8), target: target.clone().setY(max.y * 0.5) };
+    case 'door': {
+      const d = layout.door;
+      const wall = layout.walls.find((w) => w.id === d.wallId)!;
+      const c = wallPoint(wall, (d.u0 + d.u1) / 2, (d.y0 + d.y1) / 2, 0);
+      const n = new THREE.Vector3(wall.normal.x, 0, wall.normal.z);
+      const side = new THREE.Vector3(wall.dir.x, 0, wall.dir.z);
+      return {
+        position: c.clone().add(n.multiplyScalar(4.2)).add(side.multiplyScalar(1.6)).add(new THREE.Vector3(0, 0.6, 0)),
+        target: c,
+      };
+    }
+    case 'eave': {
+      const r = layout.roof;
+      const c = new THREE.Vector3(r.maxX, r.eaveY + 0.6, r.halfDepth);
+      return { position: c.clone().add(new THREE.Vector3(3.2, 0.6, 3.4)), target: c };
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "village-house-generator",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "shoot": "node scripts/shoot.mjs",
+    "sweep": "node scripts/sweep.mjs"
+  },
+  "dependencies": {
+    "lil-gui": "0.20.0",
+    "three": "0.180.0"
+  },
+  "devDependencies": {
+    "@types/three": "0.180.0",
+    "playwright": "1.56.1",
+    "typescript": "5.9.2",
+    "vite": "7.3.7"
+  }
+}
