@@ -1,10 +1,11 @@
 import * as THREE from 'three';
 import { mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { PartBuilder, boxGeometry, lumpify, mat4, mix, vary } from '../builder';
+import { PartBuilder, boxGeometry, lumpify, mat4, mix, vary, type MatKey } from '../builder';
 import { roofLift } from '../explode';
 import type { PartDef } from '../house';
 import { roofSurfaceY, type ChimneySpec, type HouseLayout } from '../layout';
 import type { Rng } from '../rng';
+import { tileCourses, type TileCourses } from './roof';
 
 /**
  * Chimney: a masonry stack (brick or field stone) rising through the roof,
@@ -41,8 +42,8 @@ export const part: PartDef = {
 // Look & feel constants
 // ---------------------------------------------------------------------------
 
-/** Lead flashing: a soft, matte blue-grey. */
-const LEAD = '#737c85';
+/** Dressed lead: a dark, slightly warm grey. */
+const LEAD = '#5a5d61';
 /** Soot inside the flue and pots (never pure black). */
 const SOOT = '#2f2926';
 const BRICK_REDS = ['#a5533b', '#9b4c38', '#b0613f', '#94493a', '#a95f45'];
@@ -51,31 +52,34 @@ const TERRACOTTA = ['#a85d3e', '#b36a47', '#9c573d'];
 /** Masonry units the stack may hold before units get scaled up (≈44 triangles each). */
 const MAX_UNITS = 230;
 
-/** Flashing dimensions (metres). */
+/** Lumpiness of the units behind the lead upstands, relative to the rest. */
+const FOOT_LUMP = 0.3;
+
+/** Flashing dimensions (metres, perpendicular to the roof unless noted). */
 const FLASH = {
-  /**
-   * Height of the collar sheets' top above `roofSurfaceY`, measured
-   * perpendicular to the slope: flush against the stack, sloping down at the
-   * outer edges so the lead looks dressed into the tile courses. The apron's
-   * edge stays higher so it still covers the tile tails below it.
-   */
-  lift: 0.016,
-  edgeLift: 0.003,
-  apronEdgeLift: 0.013,
-  /** How far sheets and upstands reach below the tile surface (perpendicular), hiding the roof hole's edge. */
-  drop: 0.07,
-  /** Collar width beside the stack (over the side tiles). */
-  side: 0.12,
-  /** Apron width down the slope on the downslope side. */
-  apron: 0.22,
-  /** Back-gutter width up the slope on the upslope side. */
-  gutter: 0.13,
+  /** Collar width beside the stack, and of the back gutter up the slope (along the slope). */
+  side: 0.09,
+  gutter: 0.09,
+  /** The apron reaches about this far down the slope; its free edge is nudged to rest mid-course. */
+  apron: 0.1,
+  apronMin: 0.06,
+  apronMax: 0.24,
+  /** Lead thickness at the free edges and in the body of a sheet, and the width of the taper. */
+  edge: 0.003,
+  body: 0.0065,
+  taper: 0.035,
+  /** Air between the tile tops and the underside of the lead. */
+  clearance: 0.003,
+  /** Where the lead bridges the step down to the next course it slopes over this length. */
+  ramp: 0.035,
+  /** How far upstands reach below the tile surface (hidden under the collar). */
+  drop: 0.06,
   /** Upstand thickness proud of the masonry face, on top of the units' own bulge. */
   stand: 0.012,
   /** Upstand height above the tiles for the apron / back gutter. */
-  standHeight: 0.1,
+  standHeight: 0.085,
   /** Minimum height of each step of the side (step) flashing above the tiles. */
-  stepHeight: 0.085,
+  stepHeight: 0.075,
 };
 
 // ---------------------------------------------------------------------------
@@ -135,6 +139,14 @@ interface Stack {
   courses: Course[];
   /** Number of courses the cap uses (they take indices 0 … capCourses-1). */
   capCourses: number;
+  /** How the stack is sealed to the roof: dressed lead, or (rustic stone stacks) a mortar fillet. */
+  seal: { kind: 'lead' } | { kind: 'fillet'; height: number; width: number };
+  /**
+   * Units starting lower than this above the tiles sit behind the lead
+   * upstands: they are laid flush (no bulge, little lumpiness) so the lead
+   * can stay thin.
+   */
+  footCover: number;
 }
 
 function planStack(layout: HouseLayout, spec: ChimneySpec, rng: Rng): Stack {
@@ -162,7 +174,12 @@ function planStack(layout: HouseLayout, spec: ChimneySpec, rng: Rng): Stack {
     courses.push({ y0: y - h, y1: y, index: i });
     y -= h;
   }
-  return { layout, spec, rect, surf, masonry, bodyTop, courses, capCourses };
+  const seal: Stack['seal'] =
+    masonry.kind === 'stone' && rng.chance(0.4)
+      ? { kind: 'fillet', height: rng.range(0.06, 0.075), width: rng.range(0.065, 0.085) }
+      : { kind: 'lead' };
+  const footCover = seal.kind === 'lead' ? Math.max(FLASH.standHeight, FLASH.stepHeight) + masonry.course * 0.5 + 0.01 : 0;
+  return { layout, spec, rect, surf, masonry, bodyTop, courses, capCourses, seal, footCover };
 }
 
 /** Brick or field stone (stone houses favour stone), sized to stay within budget. */
@@ -311,8 +328,10 @@ function layUnit(
   const mid = (p0 + p1) / 2;
   const height = course.y1 - course.y0 - m.joint - (stone ? rng.range(0, 0.022) : 0);
   const yc = (course.y0 + course.y1) / 2 + rng.jitter(stone ? 0.005 : 0.002);
-  // Mostly proud of the face, occasionally a touch sunk.
-  const out = rng.range(-0.3, 1) * m.bulge;
+  // Mostly proud of the face, occasionally a touch sunk; flush behind the flashing.
+  const zFoot = face.alongX ? (face.side > 0 ? rect.z1 : rect.z0) : p0 < 0 && p1 > 0 ? 0 : st.surf(p0) > st.surf(p1) ? p0 : p1;
+  const foot = cull && yc - height / 2 < st.surf(zFoot) + st.footCover;
+  const out = foot ? Math.min(0, rng.range(-0.3, 1) * m.bulge) : rng.range(-0.3, 1) * m.bulge;
   let cx: number, cz: number, sx: number, sz: number;
   if (face.alongX) {
     cx = mid;
@@ -327,11 +346,11 @@ function layUnit(
   }
   const color = unitColor(m, course.index, rng);
   const tiltA = rng.jitter(m.tilt);
-  const tiltB = rng.jitter(m.tilt * 0.5);
+  const tiltB = rng.jitter(m.tilt * 0.5) * (foot ? 0 : 1);
   const seed = rng.int(0, 1e6);
   // Fully under the tiles, or below the flashing upstand that covers the foot of the stack.
   if (cull && yc + height / 2 < Math.min(st.surf(cz - sz / 2), st.surf(cz + sz / 2)) + 0.03) return;
-  const geom = lumpify(chamferBox(sx, height, sz, m.chamfer), m.lump, seed);
+  const geom = lumpify(chamferBox(sx, height, sz, m.chamfer), m.lump * (foot ? FOOT_LUMP : 1), seed);
   const matrix = face.alongX ? mat4(cx, yc, cz, tiltB * 0.5, tiltB, tiltA) : mat4(cx, yc, cz, tiltA, tiltB, tiltB * 0.5);
   b.add(geom, 'stone', color, matrix);
 }
@@ -554,73 +573,359 @@ function stoneHood(b: PartBuilder, st: Stack, capRect: Rect, rng: Rng): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Lead flashing hugging the stack where it meets the roof: a collar of sheets
- * dressed over the tiles around the stack (apron downslope, back gutter
- * upslope, narrower strips beside it), upstands against the ±z faces and
- * stepped flashing climbing the ±x faces. Everything follows `roofSurfaceY`,
- * splitting at the ridge when the stack straddles it.
+ * Where the stack meets the roof: lead — a collar dressed over the tiles
+ * (apron downslope, back gutter upslope, strips beside the stack) with
+ * upstands against the ±z faces and stepped flashing up the ±x faces — or,
+ * on some rustic stone stacks, a trowelled mortar fillet all round.
+ *
+ * The roof lays the tiles near the stack exactly as `tileCourses` describes
+ * them (no hand-made jitter inside `CHIMNEY_CALM_ZONE`), so the sheets follow
+ * the real tile tops: they lie a few millimetres above them, step down over
+ * each course like dressed lead and thin out to ~3 mm at their free edges.
  */
 function buildFlashing(st: Stack, rng: Rng): PartBuilder {
   const b = new PartBuilder('chimney:flashing');
-  const { rect, surf } = st;
-  const color = vary(LEAD, rng, 0.025, 0.02, 0.004);
-  const cos = Math.cos(st.layout.roof.pitch);
-  const below = (z: number) => surf(z) - FLASH.drop / cos;
+  const tc = tileCourses(st.layout);
+  const seal = st.seal;
+  if (seal.kind === 'fillet') {
+    const color = vary(mix(st.masonry.mortar, '#c9c2b4', 0.45), rng, 0.02, 0.02, 0.004);
+    for (const side of [1, -1]) mortarFillet(b, st, tc, side, color, seal.height, seal.width, rng);
+    return b;
+  }
+  const color = vary(LEAD, rng, 0.02, 0.02, 0.004);
+  for (const side of [1, -1]) leadCollar(b, st, tc, side, color, rng);
+  leadUpstands(b, st, color, rng);
+  return b;
+}
 
-  // Collar sheets. The +z face looks down the front slope when it lies in
-  // front of the ridge (apron), otherwise up towards the ridge (back gutter).
-  // Widths are measured along the slope, so convert them to plan.
-  const downPos = rect.z1 > 0;
-  const downNeg = rect.z0 < 0;
-  const wPos = (downPos ? FLASH.apron : FLASH.gutter) * cos;
-  const wNeg = (downNeg ? FLASH.apron : FLASH.gutter) * cos;
-  const outer: Rect = { x0: rect.x0 - FLASH.side, x1: rect.x1 + FLASH.side, z0: rect.z0 - wNeg, z1: rect.z1 + wPos };
-  // Sheet top: highest against the stack, sloping down to its outer edge so it
-  // lies dressed over the tiles instead of standing on them like a plank.
-  const sheetTop = (x: number, z: number) => {
-    const tx = x < rect.x0 ? (x - outer.x0) / FLASH.side : x > rect.x1 ? (outer.x1 - x) / FLASH.side : 1;
-    const tz = z < rect.z0 ? (z - outer.z0) / wNeg : z > rect.z1 ? (outer.z1 - z) / wPos : 1;
-    const onApron = (z > rect.z1 && downPos) || (z < rect.z0 && downNeg);
-    const edge = onApron ? FLASH.apronEdgeLift : FLASH.edgeLift;
-    return surf(z) + THREE.MathUtils.lerp(edge, FLASH.lift, Math.min(tx, tz)) / cos;
+/** The stack as seen from one roof slope, in the roof's slope-local (X, Z). */
+interface SlopeStack {
+  side: number;
+  /** Local X of the stack's two side faces. */
+  x0: number;
+  x1: number;
+  /** Local Z where the downslope face meets the tile tops; the upslope face (null when the stack runs over the ridge). */
+  zDown: number;
+  zUp: number | null;
+  /** Local Z of the plumb plane through the ridge, at the tile tops. */
+  zRidge: number;
+}
+
+function slopeStack(st: Stack, tc: TileCourses, side: number): SlopeStack | null {
+  const r = st.rect;
+  const pa = Math.min(side * r.z0, side * r.z1);
+  const pb = Math.max(side * r.z0, side * r.z1);
+  if (pb <= 0.01) return null;
+  const xa = side * (r.x0 - tc.cx);
+  const xb = side * (r.x1 - tc.cx);
+  const x0 = Math.min(xa, xb);
+  const x1 = Math.max(xa, xb);
+  // Local Z where the vertical plane at plan distance p (= side · z) cuts the tile tops.
+  const at = (p: number) => {
+    let Z = p / tc.cos;
+    for (let i = 0; i < 4; i++) Z = (p - (tc.topAt(x1, Z) + FLASH.clearance) * tc.sin) / tc.cos;
+    return Z;
   };
-  // Nine-patch around the footprint (the middle cell is the stack itself).
-  const xs = [outer.x0, rect.x0, rect.x1, outer.x1];
-  const zs = [outer.z0, rect.z0, rect.z1, outer.z1];
-  for (let i = 0; i < 3; i++) {
-    for (let k = 0; k < 3; k++) {
-      if (i !== 1 || k !== 1) leadSlab(b, color, xs[i], xs[i + 1], zs[k], zs[k + 1], below, sheetTop);
+  return { side, x0, x1, zDown: at(pb), zUp: pa > 0.01 ? at(pa) : null, zRidge: at(0) };
+}
+
+/**
+ * A free edge near `want` (local Z, kept within [lo, hi]) that rests on the
+ * middle of a course's exposed tiles, clear of the steps where one course's
+ * tails drop onto the next — so the edge lies on the tiles instead of
+ * hanging over a step.
+ */
+function restingEdge(tc: TileCourses, want: number, lo: number, hi: number): number {
+  let best = THREE.MathUtils.clamp(want, lo, hi);
+  let bestD = Infinity;
+  for (let j = 0; j < tc.courses; j++) {
+    const T = tc.tail(j);
+    const a = Math.max(lo, T - tc.gauge + FLASH.ramp + 0.015);
+    const c = Math.min(hi, T - 0.03);
+    if (c < a) continue;
+    const z = THREE.MathUtils.clamp(want, a, c);
+    if (Math.abs(z - want) < bestD) {
+      bestD = Math.abs(z - want);
+      best = z;
     }
   }
+  return best;
+}
 
-  // Upstands against the faces, standing just proud of the bulgiest unit.
+/**
+ * Grid lines along the slope (local Z) for a sheet over [z0, z1]: the given
+ * breaks plus every course's tail line and the end of its ramp. Tail lines
+ * are kept exact (the sheet steps there); other lines closer than 3 mm merge.
+ */
+function slopeLines(tc: TileCourses, z0: number, z1: number, breaks: number[]): number[] {
+  const all: { z: number; tail: boolean }[] = breaks.filter((z) => z >= z0 - 1e-9 && z <= z1 + 1e-9).map((z) => ({ z, tail: false }));
+  for (let j = 0; j < tc.courses; j++) {
+    const T = tc.tail(j);
+    if (T > z0 + 1e-6 && T < z1 - 1e-6) all.push({ z: T, tail: true });
+    if (T + FLASH.ramp > z0 + 1e-6 && T + FLASH.ramp < z1 - 1e-6) all.push({ z: T + FLASH.ramp, tail: false });
+  }
+  all.sort((a, b) => a.z - b.z);
+  const out: { z: number; tail: boolean }[] = [];
+  const isEnd = (z: number) => z === z0 || z === z1;
+  for (const e of all) {
+    const last = out[out.length - 1];
+    if (last && e.z - last.z < 0.003) {
+      if (e.z - last.z < 1e-7) {
+        last.tail ||= e.tail;
+        continue;
+      }
+      // A tail line next to an end point: keep both (a sliver cell is fine, a lost step is not).
+      if ((last.tail && isEnd(e.z)) || (e.tail && isEnd(last.z))) out.push(e);
+      // Otherwise keep the tail line or the end point.
+      else if (!last.tail && !isEnd(last.z)) out[out.length - 1] = e;
+      continue;
+    }
+    out.push(e);
+  }
+  return out.map((e) => e.z);
+}
+
+/** Evenly split [a, b] into pieces no longer than `max` (both ends included). */
+function splitRange(a: number, b: number, max: number): number[] {
+  const n = Math.max(1, Math.ceil((b - a) / max));
+  return Array.from({ length: n + 1 }, (_, i) => a + ((b - a) * i) / n);
+}
+
+/** Sorted, de-duplicated grid lines. */
+function gridLines(values: number[]): number[] {
+  const v = [...values].sort((a, b) => a - b);
+  return v.filter((x, i) => i === 0 || x - v[i - 1] > 0.003);
+}
+
+const HEX_FACES = [
+  [0, 1, 2, 3],
+  [4, 5, 6, 7],
+  [0, 1, 5, 4],
+  [1, 2, 6, 5],
+  [2, 3, 7, 6],
+  [3, 0, 4, 7],
+];
+
+/**
+ * A sheet lying on the tiles of one slope: a grid of small slabs in local
+ * (X, Z) whose undersides follow the tile tops (bridging each course's step
+ * with a short ramp) and whose thickness is `thick(X, Z)`. Cells whose centre
+ * is `inside` the stack are left out. `nudge(i, k, X, Z)` moves grid vertex
+ * (i, k) by (dX, dZ) before its height is looked up and lifts its top by dY
+ * (hand-dressed edges, a slightly uneven surface).
+ */
+function drapeSheet(
+  b: PartBuilder,
+  tc: TileCourses,
+  side: number,
+  xs: number[],
+  zs: number[],
+  thick: (X: number, Z: number) => number,
+  inside: (X: number, Z: number) => boolean,
+  nudge: (i: number, k: number, X: number, Z: number) => [number, number, number],
+  mat: MatKey,
+  color: THREE.Color,
+): void {
+  const bottom: THREE.Vector3[][] = [];
+  const top: THREE.Vector3[][] = [];
+  for (let i = 0; i < xs.length; i++) {
+    bottom.push([]);
+    top.push([]);
+    for (let k = 0; k < zs.length; k++) {
+      const [dx, dz, dy] = nudge(i, k, xs[i], zs[k]);
+      const X = xs[i] + dx;
+      const Z = zs[k] + dz;
+      const y0 = tc.topAt(X, Z) + FLASH.clearance;
+      bottom[i].push(tc.toWorld(side, X, y0, Z));
+      top[i].push(tc.toWorld(side, X, y0 + thick(X, Z) + dy, Z));
+    }
+  }
+  const pos: number[] = [];
+  const centre = new THREE.Vector3();
+  for (let i = 0; i + 1 < xs.length; i++) {
+    for (let k = 0; k + 1 < zs.length; k++) {
+      if (inside((xs[i] + xs[i + 1]) / 2, (zs[k] + zs[k + 1]) / 2)) continue;
+      const c = [
+        bottom[i][k], bottom[i + 1][k], bottom[i + 1][k + 1], bottom[i][k + 1],
+        top[i][k], top[i + 1][k], top[i + 1][k + 1], top[i][k + 1],
+      ];
+      centre.set(0, 0, 0);
+      for (const p of c) centre.add(p);
+      centre.multiplyScalar(1 / 8);
+      for (const f of HEX_FACES) pushPolygon(pos, f.map((n) => c[n]), centre);
+    }
+  }
+  if (!pos.length) return;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.computeVertexNormals();
+  b.add(g, mat, color);
+}
+
+/**
+ * The lead collar on one slope: an apron down the slope whose free edge rests
+ * mid-course, strips beside the stack, and a back gutter up the slope (or up
+ * to the ridge when the stack straddles it). It tucks a little into the
+ * masonry, under the upstands.
+ */
+function leadCollar(b: PartBuilder, st: Stack, tc: TileCourses, side: number, color: THREE.Color, rng: Rng): void {
+  const s = slopeStack(st, tc, side);
+  if (!s) return;
+  const E = FLASH.taper;
+  const tuck = 0.012;
+  const xA = s.x0 - FLASH.side;
+  const xB = s.x1 + FLASH.side;
+  const zDownIn = s.zDown - tuck / tc.cos;
+  const zEdge = restingEdge(tc, s.zDown + FLASH.apron, s.zDown + FLASH.apronMin, s.zDown + FLASH.apronMax);
+  // Up the slope: a back gutter with a free edge, or (near / over the ridge) up to the ridge, under the cap.
+  let zTop = s.zRidge;
+  let zUpIn = s.zRidge;
+  let gutter = false;
+  if (s.zUp !== null) {
+    zUpIn = s.zUp + tuck / tc.cos;
+    const want = s.zUp - FLASH.gutter;
+    if (want > s.zRidge + 0.04) {
+      zTop = restingEdge(tc, want, Math.max(s.zRidge + 0.02, s.zUp - 0.16), s.zUp - 0.05);
+      gutter = true;
+    }
+  }
+  const sx0 = s.x0 + tuck;
+  const sx1 = s.x1 - tuck;
+  const xs = gridLines([xA, xA + E, ...splitRange(sx0, sx1, 0.16), xB - E, xB]);
+  const zs = slopeLines(tc, zTop, zEdge, [zTop, gutter ? zTop + E : zTop, zUpIn, zDownIn, zEdge - E, zEdge]);
+  const thick = (X: number, Z: number) => {
+    let dEdge = Math.min(X - xA, xB - X, zEdge - Z);
+    if (gutter) dEdge = Math.min(dEdge, Z - zTop);
+    return FLASH.edge + (FLASH.body - FLASH.edge) * smooth(dEdge / E);
+  };
+  const inside = (X: number, Z: number) => X > sx0 && X < sx1 && Z > zUpIn && Z < zDownIn;
+  // Hand-dressed: the free edges wander a few millimetres, the surface is not quite flat.
+  const ph = [rng.range(0, 6.3), rng.range(0, 6.3), rng.range(0, 6.3), rng.range(0, 6.3)];
+  const last = zs.length - 1;
+  const nudge = (i: number, k: number, X: number, Z: number): [number, number, number] => {
+    let dz = 0;
+    let dx = 0;
+    if (k === last) dz = 0.004 * Math.sin(X * 21 + ph[0]) + 0.002 * Math.sin(X * 53 + ph[1]);
+    else if (k === 0 && gutter) dz = 0.003 * Math.sin(X * 19 + ph[1]);
+    if (i === 0) dx = -0.003 * Math.sin(Z * 23 + ph[2]);
+    else if (i === xs.length - 1) dx = 0.003 * Math.sin(Z * 27 + ph[3]);
+    return [dx, dz, 0.0007 * Math.sin(X * 37 + Z * 29 + ph[0])];
+  };
+  drapeSheet(b, tc, side, xs, zs, thick, inside, nudge, 'mortar', color);
+  underlay(b, tc, side, xA, xB, zTop, zEdge, shade(color, -0.25));
+}
+
+/**
+ * A soaker sheet on the deck under a collar: where the roof's tiles are
+ * trimmed back around the stack, the joints of the course above show this
+ * dark sheet instead of the bare deck.
+ */
+function underlay(b: PartBuilder, tc: TileCourses, side: number, x0: number, x1: number, z0: number, z1: number, color: THREE.Color): void {
+  const y0 = tc.deck - 0.006;
+  const y1 = tc.deck + 0.003;
+  // Never past the plumb plane through the ridge (the other slope's deck).
+  z0 = Math.max(z0, -y1 * tc.tan + 0.002);
+  if (z1 - z0 < 0.01) return;
+  const V = (X: number, Y: number, Z: number) => tc.toWorld(side, X, Y, Z);
+  b.add(
+    hexahedron([V(x0, y0, z0), V(x1, y0, z0), V(x1, y0, z1), V(x0, y0, z1), V(x0, y1, z0), V(x1, y1, z0), V(x1, y1, z1), V(x0, y1, z1)]),
+    'mortar',
+    color,
+  );
+}
+
+/**
+ * Upstands against the ±z faces and stepped flashing up the ±x faces, each
+ * step tucked into a bed joint. They start below the collar (hidden) and
+ * lean in towards the masonry: thick enough at the foot to cover the units
+ * (laid flush there), thin where they tuck into the joint, like dressed lead.
+ */
+function leadUpstands(b: PartBuilder, st: Stack, color: THREE.Color, rng: Rng): void {
+  const { rect, surf } = st;
+  const cos = Math.cos(st.layout.roof.pitch);
+  const below = (z: number) => surf(z) - FLASH.drop / cos;
   const m = st.masonry;
-  const proud = FLASH.stand + m.bulge + m.lump + 0.006;
+  const lump = m.lump * FOOT_LUMP;
+  const pB = FLASH.stand + lump + 0.004;
+  const pT = lump + 0.006;
   const inside = 0.012;
+  const e = 0.003; // keeps crossing faces apart at the corners
   for (const side of [1, -1]) {
     // ±z faces: the roof is level along x there, so a straight upstand.
     const zf = side > 0 ? rect.z1 : rect.z0;
     const top = snapToJoint(st, surf(zf) + FLASH.standHeight);
-    const za = zf - side * inside;
-    const zb = zf + side * proud;
-    // Stops just short of the side upstands' outer faces so no faces coincide.
-    leadSlab(b, color, rect.x0 - proud + 0.004, rect.x1 + proud - 0.004, Math.min(za, zb), Math.max(za, zb), below, () => top);
+    const zi = zf - side * inside;
+    const span = (p: number): Rect => ({
+      x0: rect.x0 - p + e,
+      x1: rect.x1 + p - e,
+      z0: Math.min(zi, zf + side * p),
+      z1: Math.max(zi, zf + side * p),
+    });
+    leadWedge(b, vary(color, rng, 0.012, 0.01, 0.002), span(pB), span(pT), below, top);
   }
 
   // Step flashing up the ±x faces: one step per course or so, each tucked into a joint.
   const stepLen = THREE.MathUtils.clamp(m.course / Math.tan(st.layout.roof.pitch), 0.07, 0.3);
-  const z0 = rect.z0 - proud + 0.004;
-  const z1 = rect.z1 + proud - 0.004;
+  const pieces = steps(rect.z0 - pB + e, rect.z1 + pB - e, stepLen);
   for (const side of [1, -1]) {
     const xf = side > 0 ? rect.x1 : rect.x0;
-    const xa = xf - side * inside;
-    const xb = xf + side * proud;
-    for (const [s0, s1] of steps(z0, z1, stepLen)) {
+    const xi = xf - side * inside;
+    pieces.forEach(([s0, s1], i) => {
       const top = snapToJoint(st, Math.max(surf(s0), surf(s1)) + FLASH.stepHeight);
-      leadSlab(b, color, Math.min(xa, xb), Math.max(xa, xb), s0, s1, below, () => top);
-    }
+      const span = (p: number, a: number, c: number): Rect => ({
+        x0: Math.min(xi, xf + side * p),
+        x1: Math.max(xi, xf + side * p),
+        z0: a,
+        z1: c,
+      });
+      const t0 = i === 0 ? rect.z0 - pT + e : s0;
+      const t1 = i === pieces.length - 1 ? rect.z1 + pT - e : s1;
+      leadWedge(b, vary(color, rng, 0.012, 0.01, 0.002), span(pB, s0, s1), span(pT, t0, t1), below, top);
+    });
   }
-  return b;
+}
+
+/**
+ * Mortar fillet (rustic stone stacks): a trowelled cove all round the foot of
+ * the stack, `height` up the masonry and `width` out over the tiles, lumpy
+ * and thinning out onto the tiles.
+ */
+function mortarFillet(b: PartBuilder, st: Stack, tc: TileCourses, side: number, color: THREE.Color, height: number, width: number, rng: Rng): void {
+  const s = slopeStack(st, tc, side);
+  if (!s) return;
+  const tuck = 0.012;
+  const W = width;
+  const zDownIn = s.zDown - tuck / tc.cos;
+  const zUpIn = s.zUp === null ? s.zRidge : s.zUp + tuck / tc.cos;
+  const zTop = s.zUp === null ? s.zRidge : Math.max(s.zRidge, s.zUp - W);
+  const zBot = restingEdge(tc, s.zDown + W, s.zDown + 0.05, s.zDown + 0.16);
+  // Distance from the stack is stretched down the slope so the cove ends at the resting edge.
+  const stretch = W / (zBot - s.zDown);
+  const sx0 = s.x0 + tuck;
+  const sx1 = s.x1 - tuck;
+  const xs = gridLines([
+    s.x0 - W, s.x0 - 0.62 * W, s.x0 - 0.3 * W, sx0,
+    ...splitRange(sx0, sx1, 0.16),
+    sx1, s.x1 + 0.3 * W, s.x1 + 0.62 * W, s.x1 + W,
+  ]);
+  const zBreaks = [zTop, zUpIn, zDownIn, s.zDown + (0.3 * W) / stretch, s.zDown + (0.62 * W) / stretch, zBot];
+  if (s.zUp !== null) zBreaks.push(s.zUp - 0.62 * W, s.zUp - 0.3 * W);
+  const zs = slopeLines(tc, zTop, zBot, zBreaks);
+  const dist = (X: number, Z: number) => {
+    const dx = Math.max(0, s.x0 - X, X - s.x1);
+    const dz = Z > s.zDown ? (Z - s.zDown) * stretch : s.zUp !== null && Z < s.zUp ? s.zUp - Z : 0;
+    return Math.hypot(dx, dz);
+  };
+  const thick = (X: number, Z: number) => 0.004 + height * (1 - Math.min(1, dist(X, Z) / W)) ** 2;
+  const inside = (X: number, Z: number) => X > sx0 && X < sx1 && Z > zUpIn && Z < zDownIn;
+  const ph = [rng.range(0, 6.3), rng.range(0, 6.3)];
+  const nudge = (_i: number, _k: number, X: number, Z: number): [number, number, number] => {
+    const t = thick(X, Z);
+    const lump = 0.5 * Math.sin(X * 31 + Z * 17 + ph[0]) + 0.5 * Math.sin(X * 13 - Z * 41 + ph[1]);
+    return [0, 0, lump * 0.12 * (t - 0.004)];
+  };
+  drapeSheet(b, tc, side, xs, zs, thick, inside, nudge, 'mortar', color);
+  underlay(b, tc, side, xs[0], xs[xs.length - 1], zTop, zBot, shade(color, -0.3));
 }
 
 /** Split [z0, z1] into steps of about `len`, always breaking at the ridge (z = 0). */
@@ -642,40 +947,39 @@ function snapToJoint(st: Stack, y: number): number {
 }
 
 /**
- * Add a lead slab spanning [x0, x1] × [za, zb] in plan whose bottom and top
- * follow `bottomAt(z)` / `topAt(x, z)` (sampled at the corners). Split at the
- * ridge so each piece stays (nearly) planar. Lead is dull, so it goes in the
- * matte 'mortar' slot: the shiny 'metal' slot reads as polished steel.
+ * A lead block: footprint `bot` at the bottom (following `bottomAt(z)`) and
+ * `top` at height `topY`, so its faces may lean. Lead is dull, so it goes in
+ * the matte 'mortar' slot: the shiny 'metal' slot reads as polished steel.
  */
-function leadSlab(
-  b: PartBuilder,
-  color: THREE.Color,
-  x0: number,
-  x1: number,
-  za: number,
-  zb: number,
-  bottomAt: (z: number) => number,
-  topAt: (x: number, z: number) => number,
-): void {
-  if (x1 - x0 < 1e-4 || zb - za < 1e-4) return;
-  const ranges: [number, number][] = za < 0 && zb > 0 ? [[za, 0], [0, zb]] : [[za, zb]];
-  for (const [a, c] of ranges) {
-    const V = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z);
-    b.add(
-      hexahedron([
-        V(x0, bottomAt(a), a),
-        V(x1, bottomAt(a), a),
-        V(x1, bottomAt(c), c),
-        V(x0, bottomAt(c), c),
-        V(x0, topAt(x0, a), a),
-        V(x1, topAt(x1, a), a),
-        V(x1, topAt(x1, c), c),
-        V(x0, topAt(x0, c), c),
-      ]),
-      'mortar',
-      color,
-    );
-  }
+function leadWedge(b: PartBuilder, color: THREE.Color, bot: Rect, top: Rect, bottomAt: (z: number) => number, topY: number): void {
+  if (bot.x1 - bot.x0 < 1e-4 || bot.z1 - bot.z0 < 1e-4) return;
+  const V = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z);
+  b.add(
+    hexahedron([
+      V(bot.x0, bottomAt(bot.z0), bot.z0),
+      V(bot.x1, bottomAt(bot.z0), bot.z0),
+      V(bot.x1, bottomAt(bot.z1), bot.z1),
+      V(bot.x0, bottomAt(bot.z1), bot.z1),
+      V(top.x0, topY, top.z0),
+      V(top.x1, topY, top.z0),
+      V(top.x1, topY, top.z1),
+      V(top.x0, topY, top.z1),
+    ]),
+    'mortar',
+    color,
+  );
+}
+
+/** A colour with its HSL lightness shifted by dl. */
+function shade(color: THREE.Color, dl: number): THREE.Color {
+  const hsl = { h: 0, s: 0, l: 0 };
+  color.getHSL(hsl);
+  return new THREE.Color().setHSL(hsl.h, hsl.s, THREE.MathUtils.clamp(hsl.l + dl, 0.03, 0.95));
+}
+
+function smooth(t: number): number {
+  const u = THREE.MathUtils.clamp(t, 0, 1);
+  return u * u * (3 - 2 * u);
 }
 
 // ---------------------------------------------------------------------------

@@ -11,6 +11,12 @@ import type { Rng } from '../rng';
  * and barge boards, and courses of overlapping tiles; plus a ridge of
  * overlapping ridge tiles (and sometimes turned finials) on top.
  *
+ * The covering leaves every `layout.roof.holes` rectangle open (chimney,
+ * dormers): tiles are trimmed around it (or dropped) and the ridge is split
+ * where a hole reaches it. The deck stays underneath; the obstacle's owner
+ * flashes the edges. Around the chimney the tiles are laid without hand-made
+ * jitter so the chimney's lead can be dressed over them (`tileCourses`).
+ *
  * Slope-local coordinates (X, Y, Z) — everything on a slope is built in these:
  * - X along the ridge, from the roof's centre (world x for the front slope).
  * - Z down the slope from the ridge line, measured along the roof underside.
@@ -78,14 +84,26 @@ const TILE_STYLES: Record<TileKind, TileStyle> = {
 
 const SOFFIT_BOARD = 0.025; // thickness of the boards forming the deck underside
 const RAFTER_W = 0.09;
-const RAFTER_DEPTH = 0.11;
 const RAFTER_SPACING = 0.62;
-const FASCIA_T = 0.045;
 const BARGE_T = 0.05;
 const EAVE_TILE_OVERHANG = 0.04; // first course past the fascia
 const VERGE_TUCK = 0.006; // tiles end this far inside the barge boards
-const CHIMNEY_MARGIN = 0.04;
-const RIDGE_RADIUS = 0.07;
+/**
+ * Gap between the tiles and the obstacle in a roof hole. Around a dormer the
+ * tiles keep their whole thickness clear of it. Around the chimney they run
+ * right up to the masonry at the height of the lead collar, which covers
+ * them (their buried corners disappear inside the stack).
+ */
+const HOLE_GAP = { chimney: 0, dormer: 0.012 } as const;
+/** The ridge cap stops this far short of a stack straddling the ridge (it butts against the step flashing). */
+const RIDGE_GAP = { chimney: 0.035, dormer: 0.012 } as const;
+/**
+ * Tiles within this distance of a roof hole (slope-local, any direction) are
+ * laid exactly as `tileCourses` describes them, without the hand-made
+ * jitter, so whoever flashes the hole can dress lead over the real tile tops.
+ * Flashing should stay inside this zone.
+ */
+export const CALM_ZONE = { chimney: 0.4, dormer: 0.3 } as const;
 
 interface RoofDims {
   layout: HouseLayout;
@@ -103,10 +121,15 @@ interface RoofDims {
   /** Local Z of the eave edge (deck underside ends at |z| = halfDepth + overhangEave). */
   zMax: number;
   deck: number;
-  /** How far fascia and barge boards hang below the deck underside. */
+  /** Fascia thickness and how far fascia and barge boards hang below the deck underside (from the layout). */
+  fasciaT: number;
   drop: number;
+  /** Depth of the rafter tails under the deck (they hide behind the fascia). */
+  rafterDepth: number;
 
   tile: TileStyle;
+  /** Points on a rounded tile tail (fewer on very large houses). */
+  arcSteps: number;
   /** Actual course gauge (nominal gauge stretched to fit eave → ridge). */
   gauge: number;
   courses: number;
@@ -120,17 +143,22 @@ interface RoofDims {
   tileTop: number;
   /** Local Z of the eave course's tail. */
   eaveTail: number;
+  /** Tiles never reach upslope of this local Z (the plumb plane through the ridge). */
+  ridgeLimit: number;
   /** Local Y of the barge boards' top edge. */
   bargeTop: number;
 
-  /** Ridge tiles: outer surface height over the slopes (local Y), cap shell thickness, leg end (local Z). */
+  /** Ridge tiles: roll radius, outer surface height over the slopes (local Y), shell thickness, leg end (local Z). */
+  ridgeR: number;
   capH: number;
   capT: number;
   capZ: number;
 }
 
-function roofDims(layout: HouseLayout, style: TileStyle, rng: Rng): RoofDims {
+/** Every dimension of the roof. Deterministic (no rng): the chimney rebuilds the same numbers. */
+function roofDims(layout: HouseLayout): RoofDims {
   const r = layout.roof;
+  const style = TILE_STYLES[r.covering];
   const sin = Math.sin(r.pitch);
   const cos = Math.cos(r.pitch);
   const tan = Math.tan(r.pitch);
@@ -138,6 +166,8 @@ function roofDims(layout: HouseLayout, style: TileStyle, rng: Rng): RoofDims {
   const xEnd = halfLen + r.overhangGable;
   const zMax = (r.halfDepth + r.overhangEave) / cos;
   const deck = r.deckThickness;
+  const fasciaT = r.fasciaThickness;
+  const drop = r.fasciaDrop;
 
   // Bigger tiles on very large roofs keep the triangle count bounded.
   const estTiles = (2 * xEnd * zMax) / (style.width * style.gauge);
@@ -149,19 +179,22 @@ function roofDims(layout: HouseLayout, style: TileStyle, rng: Rng): RoofDims {
   const rise = (tile.thickness * tile.length) / tile.gauge;
   const tilt = Math.atan2(rise, tile.length);
   const yHead = deck + 0.004;
-  const sagMax = rng.range(0.004, 0.018);
-  const tileTop = yHead + rise + tile.thickness + sagMax + 0.004;
+  // A slight hand-laid sag towards the gable ends; long roofs sag a little more.
+  const sagMax = clamp(0.0015 * 2 * xEnd, 0.006, 0.016);
+  const tileTop = yHead + rise + tile.thickness / Math.cos(tilt) + sagMax + 0.004;
 
-  // Ridge cap: legs parallel to the slopes, rounded over the apex. The shell
-  // must clear the tiles even where the rounding cuts the corner.
-  const capT = Math.max(0.035, RIDGE_RADIUS * (1 - cos) + 0.015);
+  // Ridge cap: half-round ridge tiles, legs parallel to the slopes, rolled
+  // over the apex. Flatter roofs get a wider roll so it still reads round.
+  // The shell must clear the tiles even where the roll cuts the corner.
+  const ridgeR = clamp(0.085 / sin, 0.11, 0.2);
+  const capT = Math.max(0.035, ridgeR * (1 - cos) + 0.014);
   const capH = tileTop + capT;
-  const zArc = -(capH - RIDGE_RADIUS) * tan; // where the rounding meets the leg
-  const capZ = Math.max(zArc + 0.1, -deck * tan + 0.06);
+  const zArc = -(capH - ridgeR) * tan; // where the roll meets the leg
+  const capZ = Math.max(zArc + 0.055, -deck * tan + 0.06);
 
   // Courses from the eave (tail just past the fascia) to the ridge (last tail
   // tucked under the ridge cap).
-  const eaveTail = zMax + FASCIA_T + EAVE_TILE_OVERHANG;
+  const eaveTail = zMax + fasciaT + EAVE_TILE_OVERHANG;
   const lastTail = capZ - 0.03;
   const courses = Math.max(2, Math.round((eaveTail - lastTail) / tile.gauge) + 1);
   const gauge = (eaveTail - lastTail) / (courses - 1);
@@ -178,8 +211,11 @@ function roofDims(layout: HouseLayout, style: TileStyle, rng: Rng): RoofDims {
     halfDepth: r.halfDepth,
     zMax,
     deck,
-    drop: RAFTER_DEPTH + 0.025,
+    fasciaT,
+    drop,
+    rafterDepth: Math.min(0.11, drop - 0.025),
     tile,
+    arcSteps: layout.detail < 0.8 ? 4 : 6,
     gauge,
     courses,
     tilt,
@@ -187,11 +223,73 @@ function roofDims(layout: HouseLayout, style: TileStyle, rng: Rng): RoofDims {
     sagMax,
     tileTop,
     eaveTail,
+    ridgeLimit: -yHead * tan + 0.006,
     bargeTop: tileTop + 0.004,
+    ridgeR,
     capH,
     capT,
     capZ,
   };
+}
+
+/**
+ * The tile courses as plain numbers, for lead flashing over the tiles: where
+ * each course's tails lie and how high the (unjittered) tiles stand. Tiles
+ * inside `CALM_ZONE` of a roof hole are laid exactly like this.
+ */
+export interface TileCourses {
+  sin: number;
+  cos: number;
+  tan: number;
+  /** Roof centre along x: slope-local X = side * (x - cx). */
+  cx: number;
+  /** Local Y of the deck top (tile heads rest just above it). */
+  deck: number;
+  courses: number;
+  gauge: number;
+  /** Local Z of course j's tail (j = 0 is the eave course, Z grows down the slope). */
+  tail: (j: number) => number;
+  /** Tiles never reach upslope of this local Z. */
+  ridgeLimit: number;
+  /** Local Y of the top of the uppermost tile at (X, Z); at a tail line, the course ending there. */
+  topAt: (X: number, Z: number) => number;
+  /** Slope-local (X, Y, Z) on slope `side` (+1 front, -1 back) → world. */
+  toWorld: (side: number, X: number, Y: number, Z: number) => THREE.Vector3;
+}
+
+export function tileCourses(layout: HouseLayout): TileCourses {
+  const d = roofDims(layout);
+  return {
+    sin: d.sin,
+    cos: d.cos,
+    tan: d.tan,
+    cx: d.cx,
+    deck: d.deck,
+    courses: d.courses,
+    gauge: d.gauge,
+    tail: (j) => d.eaveTail - j * d.gauge,
+    ridgeLimit: d.ridgeLimit,
+    topAt: (X, Z) => tileTopAt(d, X, Z),
+    toWorld: (side, X, Y, Z) => {
+      const [z, y] = toWorld(d, Z, Y);
+      return new THREE.Vector3(d.cx + side * X, y, side * z);
+    },
+  };
+}
+
+/** Top (local Y) of the uppermost calm tile at (X, Z). */
+function tileTopAt(d: RoofDims, X: number, Z: number): number {
+  const t = d.tile;
+  // The course on top at Z is the one whose tail is the first at or below Z.
+  const j = clamp(Math.floor((d.eaveTail - Z) / d.gauge + 1e-9), 0, d.courses - 1);
+  const s = Z - (d.eaveTail - j * d.gauge - t.length);
+  const under = d.yHead + s * Math.tan(d.tilt);
+  return under + tileThick(t, s, t.length) / Math.cos(d.tilt) + sagAt(d, X);
+}
+
+/** Plate thickness at distance s from the head (shingles thicken towards the butt). */
+function tileThick(t: TileStyle, s: number, len: number): number {
+  return t.kind === 'shingle' ? t.thickness * (0.5 + 0.5 * clamp(s / len, 0, 1)) : t.thickness;
 }
 
 /** Slope-local (Z, Y) → canonical world (z, y). */
@@ -225,7 +323,8 @@ function sagAt(d: RoofDims, X: number): number {
 
 interface RoofColors {
   tile: THREE.Color;
-  moss: THREE.Color;
+  /** Yellow-green lichen, two tones. */
+  lichen: [THREE.Color, THREE.Color];
   ridge: THREE.Color;
   trim: THREE.Color; // barge boards, fascia
   structure: THREE.Color; // rafters, purlins
@@ -238,7 +337,7 @@ function roofColors(layout: HouseLayout, rng: Rng): RoofColors {
   const pal = layout.params.palette;
   return {
     tile: new THREE.Color(pal.roof),
-    moss: new THREE.Color('#5f6f45'),
+    lichen: [new THREE.Color('#9aa25a'), new THREE.Color('#8a9a4c')],
     ridge: shade(pal.roof, -0.07),
     trim: new THREE.Color(rng.chance(0.6) ? pal.timber : pal.wood),
     structure: new THREE.Color(pal.timber),
@@ -272,8 +371,7 @@ export const part: PartDef = {
   label: 'Roof',
   explode: [0, 0, 0],
   build: ({ layout, rng }) => {
-    const style = TILE_STYLES[layout.roof.covering];
-    const d = roofDims(layout, style, rng.fork('dims'));
+    const d = roofDims(layout);
     const colors = roofColors(layout, rng.fork('colors'));
     const lift = roofLift(layout);
 
@@ -339,15 +437,22 @@ function addRafterTails(b: PartBuilder, d: RoofDims, side: number, frame: THREE.
   if (len <= 0.05) return;
   const span = d.halfLen - 0.25;
   const n = Math.max(2, Math.round((2 * span) / RAFTER_SPACING) + 1);
+  const depth = d.rafterDepth;
   // Lowest point of a rafter at distance w in front of the wall face.
-  const yLow = (w: number) => d.layout.roof.eaveY - RAFTER_DEPTH / d.cos - Math.max(0, w) * d.tan;
-  const rafter = boxGeometry(RAFTER_W, RAFTER_DEPTH, len, 0.016, 1);
+  const yLow = (w: number) => d.layout.roof.eaveY - depth / d.cos - Math.max(0, w) * d.tan;
+  // On a cottage the door wall carries the eave: keep out of the door hood's zone.
+  const hood = d.layout.door.wallId === wall.id ? d.layout.doorHood : null;
+  const hoodOut = Math.min(hood?.w1 ?? 0, d.layout.roof.overhangEave);
+  const rafter = boxGeometry(RAFTER_W, depth, len, 0.016, 1);
   for (let i = 0; i < n; i++) {
     const X = -span + (2 * span * i) / (n - 1);
     // u along the eave wall (front and back walk opposite ways, and so do the canonical frames).
     const u = X + d.halfLen;
-    if (blockedByOpening(wall, u - RAFTER_W / 2, u + RAFTER_W / 2, yLow)) continue;
-    const m = mul(frame, mat4(X, -RAFTER_DEPTH / 2, zIn + len / 2, 0, rng.jitter(0.012), 0));
+    const u0 = u - RAFTER_W / 2;
+    const u1 = u + RAFTER_W / 2;
+    if (blockedByOpening(wall, u0, u1, yLow)) continue;
+    if (hood && u1 > hood.u0 && u0 < hood.u1 && yLow(hoodOut) < hood.y1 + 0.02) continue;
+    const m = mul(frame, mat4(X, -depth / 2, zIn + len / 2, 0, rng.jitter(0.012), 0));
     b.add(rafter, 'timber', vary(colors.structure, rng, 0.04, 0.03, 0.005), m);
   }
 }
@@ -402,13 +507,17 @@ function addPurlins(b: PartBuilder, d: RoofDims, side: number, frame: THREE.Matr
   }
 }
 
-/** Fascia board across the eave end of the deck, hiding the rafter ends; the first course rests on it. */
+/**
+ * Fascia board across the eave end of the deck, hiding the rafter ends; the
+ * first course rests on it. Its sizes come from the layout, which used them
+ * to keep the eave edge clear of the top storey's lintels.
+ */
 function addFascia(b: PartBuilder, d: RoofDims, frame: THREE.Matrix4, colors: RoofColors) {
-  const top = starterUndersideAt(d, d.zMax + FASCIA_T) - 0.004;
+  const top = starterUndersideAt(d, d.zMax + d.fasciaT) - 0.004;
   const h = top + d.drop;
   const len = 2 * (d.xEnd + 0.004);
-  const m = mul(frame, mat4(0, top - h / 2, d.zMax + FASCIA_T / 2));
-  b.box('wood', colors.trim, len, h, FASCIA_T, m, 0.014);
+  const m = mul(frame, mat4(0, top - h / 2, d.zMax + d.fasciaT / 2));
+  b.box('wood', colors.trim, len, h, d.fasciaT, m, 0.012);
 }
 
 /**
@@ -478,68 +587,173 @@ interface TileRect {
   zt: number;
 }
 
-/** Courses of tiles, eave to ridge, staggered, fitted around the chimney. */
+/** A roof hole as seen from one slope. */
+interface SlopeHole {
+  kind: 'chimney' | 'dormer';
+  /** Tiles may reach into the obstacle below the top of their neighbours (a lead collar covers the joint). */
+  tight: boolean;
+  /** Slope-local X range, gap included. */
+  x0: number;
+  x1: number;
+  /** Plan distance from the ridge line on this slope (side · z), gap included; p0 < 0 when the hole runs over the ridge. */
+  p0: number;
+  p1: number;
+  /** Rough local Z range through the tile layer (for quick rejection). */
+  z0: number;
+  z1: number;
+}
+
+/** `layout.roof.holes` that reach this slope, in its local coordinates. */
+function slopeHoles(d: RoofDims, side: number): SlopeHole[] {
+  const out: SlopeHole[] = [];
+  for (const h of d.layout.roof.holes) {
+    const pa = Math.min(side * h.z0, side * h.z1);
+    const pb = Math.max(side * h.z0, side * h.z1);
+    if (pb <= 0) continue;
+    const g = HOLE_GAP[h.kind];
+    const xa = side * (h.x0 - d.cx);
+    const xb = side * (h.x1 - d.cx);
+    out.push({
+      kind: h.kind,
+      tight: h.kind === 'chimney',
+      x0: Math.min(xa, xb) - g,
+      x1: Math.max(xa, xb) + g,
+      p0: pa - g,
+      p1: pb + g,
+      z0: (pa - g - d.tileTop * d.sin) / d.cos,
+      z1: (pb + g - d.deck * d.sin) / d.cos,
+    });
+  }
+  return out;
+}
+
+/**
+ * Courses of tiles, eave to ridge, staggered, trimmed around every roof hole.
+ * Lichen grows in patches; near the chimney the tiles lie calm and exact.
+ */
 function addTiles(b: PartBuilder, d: RoofDims, side: number, frame: THREE.Matrix4, colors: RoofColors, rng: Rng) {
   const t = d.tile;
   const halfSpan = d.xEnd + VERGE_TUCK;
   const tanTilt = Math.tan(d.tilt);
-  const obstacle = chimneyObstacle(d, side);
+  const th = t.thickness / Math.cos(d.tilt);
+  const holes = slopeHoles(d, side);
+  const calms: TileRect[] = holes.map((h) => {
+    const m = CALM_ZONE[h.kind];
+    return { x0: h.x0 - m, x1: h.x1 + m, zh: h.z0 - m, zt: h.z1 + m };
+  });
   const noise = patchNoise(rng.fork('noise'));
-  const mossNoise = patchNoise(rng.fork('moss'), 2.5);
-  // Moss grows in a few clusters, more on the back (shady) slope and on shingles.
-  const mossBase = (side < 0 ? 0.35 : 0.15) * (t.kind === 'shingle' ? 2 : 1);
-  // Tiles never cross the plumb plane through the ridge (the other slope's side).
-  const ridgeLimit = -d.yHead * d.tan + 0.006;
+  const lichen = lichenField(d, side, rng.fork('lichen'));
+  const minW = Math.max(0.06, 0.25 * t.width);
+  const minL = Math.max(0.06, 0.2 * t.length);
 
   const palette = new TilePalette(t, colors, rng.fork('palette'));
   const batch = new PieceBatch(palette.colors.length);
   let prevJoints: number[] = [];
   for (let j = 0; j < d.courses; j++) {
     const courseTail = d.eaveTail - j * d.gauge;
+    const band = { zh: courseTail - t.length, zt: courseTail };
     const wave = { a: t.wave * rng.range(0.3, 1), k: (Math.PI * 2) / rng.range(2.5, 6), ph: rng.range(0, Math.PI * 2) };
-    const joints = courseJoints(-halfSpan, halfSpan, t, j % 2 === 1, prevJoints, rng);
+    const joints = snapToHoles(courseJoints(-halfSpan, halfSpan, t, j % 2 === 1, prevJoints, rng), holes, band, 0.4 * t.width);
     prevJoints = joints;
+    const calmHere = calms.filter((c) => band.zt + 0.03 > c.zh && band.zh - 0.03 < c.zt);
 
     for (let k = 0; k + 1 < joints.length; k++) {
       const x0 = joints[k] + (k === 0 ? 0 : t.gap / 2);
       const x1 = joints[k + 1] - (k + 2 === joints.length ? 0 : t.gap / 2);
-      const xc0 = (x0 + x1) / 2;
-      const dz = wave.a * Math.sin(xc0 * wave.k + wave.ph) + rng.jitter(0.006);
-      const tail = courseTail + dz;
-      const length = t.length * (1 + rng.jitter(0.02));
-      const rect = fitAround({ x0, x1, zh: Math.max(tail - length, ridgeLimit), zt: tail }, obstacle, t);
+      const xc = (x0 + x1) / 2;
+      // Hand-laid irregularity, except where the chimney's lead lies over the
+      // tiles; the course line's waviness fades out smoothly towards it.
+      const distCalm = calmHere.reduce((m, c) => Math.min(m, Math.max(c.x0 - x1, x0 - c.x1, 0)), Infinity);
+      const quiet = distCalm === 0;
+      const fade = smoothstep(distCalm, 0, 0.8);
+      const jit = [rng.jitter(0.006), rng.jitter(0.02), rng.jitter(0.008), rng.jitter(0.022), rng.jitter(0.015)];
+      const tail = courseTail + wave.a * Math.sin(xc * wave.k + wave.ph) * fade + (quiet ? 0 : jit[0]);
+      const length = t.length * (1 + (quiet ? 0 : jit[1]));
+      // Underside of this tile: Y = a + tanTilt · Z (its nominal head rests on the deck).
+      const a = d.yHead - (tail - length) * tanTilt + sagAt(d, xc);
+      const full: TileRect = { x0, x1, zh: Math.max(tail - length, d.ridgeLimit), zt: tail };
+      let rect: TileRect | null = full;
+      for (const h of holes) {
+        rect = cutTile(rect, h, a, tanTilt, th, d, minW, minL);
+        if (!rect) break;
+      }
       if (!rect || rect.zt - rect.zh < 0.05) continue;
+      // Pieces cut at (or lying close to) a hole keep exactly to their outline.
+      const still = quiet || rect !== full || holes.some((h) => nearHole(full, h, a, tanTilt, th, d));
 
       const w = rect.x1 - rect.x0;
       const len = rect.zt - rect.zh;
-      const xc = (rect.x0 + rect.x1) / 2;
-      // Underside line of this tile (its nominal head rests on the deck).
-      const yHeadHere = d.yHead + (rect.zh - (tail - length)) * tanTilt + sagAt(d, xc);
-      const mesh = tileMesh(t.kind, w, len / Math.cos(d.tilt), t.thickness, rng);
-      const m = mul(frame, mat4(xc, yHeadHere, rect.zh, -d.tilt + rng.jitter(0.008), rng.jitter(0.022), rng.jitter(0.015)));
-      const cluster = Math.max(0, mossNoise(xc * side, rect.zt) - 0.35);
-      const moss = mossBase * cluster * (0.5 + rect.zt / d.zMax) + 0.003;
-      batch.add(mesh, m, palette.pick(rng, noise(xc * 0.9 * side, rect.zt * 0.9), moss));
+      const xr = (rect.x0 + rect.x1) / 2;
+      // Only the eave course and the verge tiles ever show their underside.
+      const bottom = j === 0 || k === 0 || k + 2 === joints.length;
+      // Thickness (shingles taper) follows the uncut tile, so cut pieces match their neighbours.
+      const s0 = rect.zh - (tail - length);
+      const mesh = tileMesh(t.kind, w, len / Math.cos(d.tilt), (z) => tileThick(t, s0 + z, length), d.arcSteps, bottom, rng);
+      const m = mul(
+        frame,
+        mat4(xr, a + tanTilt * rect.zh, rect.zh, -d.tilt + (still ? 0 : jit[2]), still ? 0 : jit[3], still ? 0 : jit[4]),
+      );
+      batch.add(mesh, m, palette.pick(rng, noise(xc * 0.9 * side, rect.zt * 0.9), lichen(xr, rect.zt)));
     }
   }
   batch.flush(b, 'roof', palette.colors);
 }
 
 /**
- * The tile colours of one slope: a few dozen variations around the roof
- * colour (sorted light → dark), some burnt darker ones and some mossy ones.
- * Tiles pick from it, so a slope is a handful of uniformly coloured batches.
+ * Lichen grows in a few coherent patches of a handful of tiles: mostly on
+ * the lower courses near the eave, along the verges and on the (shady) back
+ * slope; more on wooden shingles. Returns the strength (0 = none … 1) for a
+ * tile whose tail centre is at (X, Z).
+ */
+function lichenField(d: RoofDims, side: number, rng: Rng): (X: number, Z: number) => number {
+  const t = d.tile;
+  const span = d.eaveTail - d.capZ;
+  const area = 2 * d.xEnd * span;
+  const density = (side < 0 ? 0.11 : 0.045) * (t.kind === 'shingle' ? 1.6 : 1);
+  const count = Math.round(area * density * rng.range(0.6, 1.4));
+  const blobs: { x: number; z: number; rx: number; rz: number; s: number }[] = [];
+  for (let i = 0; i < count; i++) {
+    // Low on the slope, sometimes hugging a verge.
+    const z = d.eaveTail - span * rng.next() ** 1.8 * 0.85;
+    const nearVerge = rng.chance(0.35);
+    const x = nearVerge ? (rng.chance(0.5) ? 1 : -1) * (d.xEnd - rng.range(0.1, 0.7)) : rng.range(-d.xEnd, d.xEnd);
+    const rx = t.width * rng.range(1.1, 2.1);
+    const rz = d.gauge * rng.range(0.9, 1.7);
+    const s = rng.range(0.7, 1);
+    blobs.push({ x, z, rx, rz, s });
+    // A smaller lobe beside it keeps the patch from being a perfect ellipse.
+    if (rng.chance(0.7)) {
+      const a = rng.range(0, Math.PI * 2);
+      blobs.push({ x: x + Math.cos(a) * rx * 0.8, z: z + Math.sin(a) * rz * 0.8, rx: rx * 0.6, rz: rz * 0.65, s: s * 0.85 });
+    }
+  }
+  return (X, Z) => {
+    let best = 0;
+    for (const b of blobs) {
+      const q = ((X - b.x) / b.rx) ** 2 + ((Z - b.z) / b.rz) ** 2;
+      // Strongest in the middle of a patch, fading out at its rim.
+      if (q < 1) best = Math.max(best, b.s * (1 - q));
+    }
+    return best;
+  };
+}
+
+/**
+ * The tile colours of one slope: a couple of dozen variations around the
+ * roof colour (sorted light → dark), a few burnt darker ones and lichen-tinted
+ * ones (sorted by how much lichen). Tiles pick from it, so a slope is a
+ * handful of uniformly coloured batches.
  */
 class TilePalette {
   readonly colors: THREE.Color[] = [];
   private readonly normal: number[] = [];
   private readonly dark: number[] = [];
-  private readonly mossy: number[] = [];
+  private readonly lichen: number[] = [];
 
   constructor(t: TileStyle, colors: RoofColors, rng: Rng) {
     const [l, s, h] = t.jitter;
     const lightness = (c: THREE.Color) => c.getHSL({ h: 0, s: 0, l: 0 }).l;
-    const normal = Array.from({ length: 20 }, () => vary(colors.tile, rng, l * 1.4, s, h));
+    const normal = Array.from({ length: 20 }, () => vary(colors.tile, rng, l * 1.25, s, h));
     normal.sort((a, b) => lightness(b) - lightness(a));
     // Each list holds indices into `colors` (one batch per colour).
     const put = (list: number[], c: THREE.Color) => {
@@ -547,15 +761,25 @@ class TilePalette {
       this.colors.push(c);
     };
     for (const c of normal) put(this.normal, c);
-    for (let i = 0; i < 4; i++) put(this.dark, vary(colors.tile, rng, l, s, h).multiplyScalar(rng.range(0.76, 0.88)));
-    for (let i = 0; i < 6; i++) put(this.mossy, mix(vary(colors.tile, rng, l, s, h), colors.moss, rng.range(0.2, 0.45)));
+    for (let i = 0; i < 4; i++) put(this.dark, vary(colors.tile, rng, l, s, h).multiplyScalar(rng.range(0.78, 0.88)));
+    for (let i = 0; i < 6; i++) {
+      const tint = vary(colors.lichen[i % 2], rng, 0.03, 0.04, 0.01);
+      put(this.lichen, mix(vary(colors.tile, rng, l, s, h), tint, 0.12 + (0.3 * i) / 5));
+    }
   }
 
-  /** Colour index for a tile in a weathering patch (-1 dark … 1 light) with the given chance of moss. */
-  pick(rng: Rng, patch: number, moss: number): number {
-    if (rng.chance(0.04)) return this.dark[rng.int(0, this.dark.length - 1)];
-    if (rng.chance(moss)) return this.mossy[rng.int(0, this.mossy.length - 1)];
-    const u = clamp(rng.next() * 0.65 + (0.5 - patch * 0.5) * 0.35, 0, 0.999);
+  /**
+   * Colour index for a tile in a weathering patch (-1 dark … 1 light) with
+   * the given lichen strength (0 … 1). Most of the light/dark variation
+   * follows the smooth patches, a little stays per tile.
+   */
+  pick(rng: Rng, patch: number, lichen: number): number {
+    if (lichen > 0.06 && rng.chance(Math.min(1, 0.3 + lichen))) {
+      const i = Math.floor(clamp(lichen * rng.range(0.8, 1.1), 0, 0.999) * this.lichen.length);
+      return this.lichen[i];
+    }
+    if (rng.chance(0.03)) return this.dark[rng.int(0, this.dark.length - 1)];
+    const u = clamp(rng.next() * 0.45 + (0.5 - patch * 0.5) * 0.55, 0, 0.999);
     return this.normal[Math.floor(u * this.normal.length)];
   }
 }
@@ -589,59 +813,78 @@ function courseJoints(x0: number, x1: number, t: TileStyle, odd: boolean, prev: 
   return out;
 }
 
-interface Obstacle {
-  x0: number;
-  x1: number;
-  z0: number;
-  z1: number;
-}
-
-/** The chimney's footprint in this slope's local (X, Z), where it passes through the tile layer. */
-function chimneyObstacle(d: RoofDims, side: number): Obstacle | null {
-  const c = d.layout.chimney;
-  if (!c) return null;
-  const x = side * (c.x - d.cx);
-  const z = side * c.z;
-  const zA = z - c.sz / 2;
-  const zB = z + c.sz / 2;
-  if (zB <= 0) return null; // entirely on the other slope
-  return {
-    x0: x - c.sx / 2 - CHIMNEY_MARGIN,
-    x1: x + c.sx / 2 + CHIMNEY_MARGIN,
-    // The tile layer spans Y ∈ [deck, tileTop]: Z = (z - Y sin) / cos.
-    z0: (zA - d.tileTop * d.sin) / d.cos - CHIMNEY_MARGIN,
-    z1: (zB - d.deck * d.sin) / d.cos + CHIMNEY_MARGIN,
-  };
+/**
+ * Move a joint onto a hole's edge where cutting the tile there would leave a
+ * sliver: the neighbouring tile grows a little instead (as a roofer would use
+ * a tile-and-a-half).
+ */
+function snapToHoles(joints: number[], holes: SlopeHole[], band: { zh: number; zt: number }, minPiece: number): number[] {
+  const out = joints;
+  for (const h of holes) {
+    if (band.zt < h.z0 || band.zh > h.z1) continue;
+    for (let k = 1; k + 1 < out.length; k++) {
+      // Tile [out[k], out[k+1]] holds the left edge: the piece left of it is [out[k], x0].
+      if (out[k] < h.x0 && out[k + 1] > h.x0 && h.x0 - out[k] < minPiece) out[k] = h.x0;
+    }
+    for (let k = out.length - 2; k >= 1; k--) {
+      // Tile [out[k-1], out[k]] holds the right edge: the piece right of it is [x1, out[k]].
+      if (out[k - 1] < h.x1 && out[k] > h.x1 && out[k] - h.x1 < minPiece) out[k] = h.x1;
+    }
+  }
+  return out;
 }
 
 /**
- * Trim a tile so it keeps clear of an obstacle: keep the largest piece left
- * after cutting it on one side, or drop it if nothing sensible remains.
+ * How far a tile reaches in plan (side · z), for underside Y = a + b·Z: its
+ * head's bottom edge and its tail's top edge — or, for a tight hole, its
+ * head's top edge and its tail's bottom edge (the parts that would show).
  */
-function fitAround(r: TileRect, o: Obstacle | null, t: TileStyle): TileRect | null {
-  if (!o || r.x1 <= o.x0 || r.x0 >= o.x1 || r.zt <= o.z0 || r.zh >= o.z1) return r;
-  const minW = 0.35 * t.width;
-  const minL = 0.3 * t.length;
+function planReach(r: TileRect, a: number, b: number, th: number, d: RoofDims, tight = false): [number, number] {
+  const head = tight ? th : 0;
+  const tail = tight ? 0 : th;
+  return [r.zh * d.cos + (a + b * r.zh + head) * d.sin, r.zt * d.cos + (a + b * r.zt + tail) * d.sin];
+}
+
+/**
+ * Trim a tile so it keeps clear of a hole (its whole thickness, measured in
+ * plan): keep the largest piece left after cutting it on one side, or drop
+ * it if nothing sensible remains. Returns `r` itself when it does not touch.
+ */
+function cutTile(r: TileRect, h: SlopeHole, a: number, b: number, th: number, d: RoofDims, minW: number, minL: number): TileRect | null {
+  if (r.x1 <= h.x0 || r.x0 >= h.x1 || r.zt < h.z0 - 0.3 || r.zh > h.z1 + 0.3) return r;
+  const [pHead, pTail] = planReach(r, a, b, th, d, h.tight);
+  if (pTail <= h.p0 || pHead >= h.p1) return r;
+  const k = d.cos + b * d.sin;
   const options: TileRect[] = [
-    { ...r, x1: o.x0 },
-    { ...r, x0: o.x1 },
-    { ...r, zh: o.z1 },
-    { ...r, zt: o.z0 },
-  ].filter((c) => c.x1 - c.x0 >= minW && c.zt - c.zh >= minL);
+    { ...r, x1: h.x0 },
+    { ...r, x0: h.x1 },
+    // Below the hole: head cut where its bottom (top, if tight) reaches the hole's lower edge.
+    { ...r, zh: (h.p1 - (a + (h.tight ? th : 0)) * d.sin) / k },
+    // Above it: tail cut where its top (bottom, if tight) reaches the hole's upper edge.
+    { ...r, zt: (h.p0 - (a + (h.tight ? 0 : th)) * d.sin) / k },
+  ].filter((c) => c.x1 - c.x0 >= minW && c.zt - c.zh >= minL && c.zh >= r.zh - 1e-9 && c.zt <= r.zt + 1e-9);
   if (!options.length) return null;
   const area = (c: TileRect) => (c.x1 - c.x0) * (c.zt - c.zh);
-  return options.reduce((a, c) => (area(c) > area(a) ? c : a));
+  return options.reduce((best, c) => (area(c) > area(best) ? c : best));
+}
+
+/** Is the tile within a few centimetres of a hole (where its jitter could carry it in)? */
+function nearHole(r: TileRect, h: SlopeHole, a: number, b: number, th: number, d: RoofDims): boolean {
+  const m = 0.04;
+  if (r.x1 <= h.x0 - m || r.x0 >= h.x1 + m) return false;
+  const [pHead, pTail] = planReach(r, a, b, th, d);
+  return pTail > h.p0 - m && pHead < h.p1 + m;
 }
 
 /** Outline of a tile in its own (x, z) plane: x across, z from head (0) to tail (len). */
-function tileOutline(kind: TileKind, w: number, len: number, rng: Rng): [number, number][] {
+function tileOutline(kind: TileKind, w: number, len: number, steps: number, rng: Rng): [number, number][] {
   const hw = w / 2;
   const j = () => rng.jitter(0.003);
   const pts: [number, number][] = [
     [-hw, 0],
     [hw, 0],
   ];
-  const arc = (tailH: number, exponent: number, steps: number) => {
+  const arc = (tailH: number, exponent: number) => {
     const e = 2 / exponent;
     for (let k = 0; k <= steps; k++) {
       const phi = (k / steps) * Math.PI;
@@ -652,10 +895,10 @@ function tileOutline(kind: TileKind, w: number, len: number, rng: Rng): [number,
   };
   switch (kind) {
     case 'beaver':
-      arc(Math.min(len * 0.35, w * 0.34), 2.6, 6);
+      arc(Math.min(len * 0.35, w * 0.34), 2.6);
       break;
     case 'fish':
-      arc(Math.min(len * 0.45, hw), 2, 6);
+      arc(Math.min(len * 0.45, hw), 2);
       break;
     case 'slate': {
       const r = Math.min(0.045, w * 0.22, len * 0.3);
@@ -680,11 +923,20 @@ function tileOutline(kind: TileKind, w: number, len: number, rng: Rng): [number,
 
 /**
  * A thin plate with softly rounded edges: bottom ring, slightly inset top
- * ring and centre fans, with hand-set normals so it shades like a pillowy
- * tile. Built at its real size (no scaling) so the normals stay right.
+ * ring and a centre fan on top (and underneath only where it can be seen),
+ * with hand-set normals so it shades like a pillowy tile. Built at its real
+ * size (no scaling) so the normals stay right.
  */
-function tileMesh(kind: TileKind, w: number, len: number, th: number, rng: Rng): RawMesh {
-  let outline = tileOutline(kind, w, len, rng);
+function tileMesh(
+  kind: TileKind,
+  w: number,
+  len: number,
+  thick: (z: number) => number,
+  steps: number,
+  bottomFan: boolean,
+  rng: Rng,
+): RawMesh {
+  let outline = tileOutline(kind, w, len, steps, rng);
   // Wind counter-clockwise seen from +Y (negative shoelace sum in x/z).
   const shoelace = outline.reduce((s, p, i) => {
     const q = outline[(i + 1) % outline.length];
@@ -695,7 +947,6 @@ function tileMesh(kind: TileKind, w: number, len: number, th: number, rng: Rng):
   const cx = outline.reduce((s, p) => s + p[0], 0) / n;
   const cz = outline.reduce((s, p) => s + p[1], 0) / n;
   const inset = Math.min(0.012, w * 0.08, len * 0.08);
-  const thick = (z: number) => (kind === 'shingle' ? th * (0.5 + 0.5 * clamp(z / len, 0, 1)) : th);
 
   const pos: number[] = [];
   const nor: number[] = [];
@@ -721,7 +972,6 @@ function tileMesh(kind: TileKind, w: number, len: number, th: number, rng: Rng):
     return [ox / l, oz / l];
   });
 
-  const bottomC = vert(cx, 0, cz, 0, -1, 0);
   const bottom = outline.map((p, i) => vert(p[0], 0, p[1], outward[i][0], -0.35, outward[i][1]));
   const top = outline.map((p, i) => {
     const dx = cx - p[0];
@@ -730,11 +980,12 @@ function tileMesh(kind: TileKind, w: number, len: number, th: number, rng: Rng):
     return vert(p[0] + (dx / l) * inset, thick(p[1]), p[1] + (dz / l) * inset, outward[i][0] * 0.55, 1, outward[i][1] * 0.55);
   });
   const topC = vert(cx, thick(cz) * 1.04, cz, 0, 1, 0);
+  const bottomC = bottomFan ? vert(cx, 0, cz, 0, -1, 0) : -1;
 
   for (let i = 0; i < n; i++) {
     const i2 = (i + 1) % n;
     idx.push(topC, top[i], top[i2]);
-    idx.push(bottomC, bottom[i2], bottom[i]);
+    if (bottomFan) idx.push(bottomC, bottom[i2], bottom[i]);
     idx.push(bottom[i], bottom[i2], top[i2]);
     idx.push(bottom[i], top[i2], top[i]);
   }
@@ -753,16 +1004,16 @@ interface ProfilePoint {
 
 /** World y of the ridge cap's outer apex (without sag). */
 function ridgeCapTopY(d: RoofDims): number {
-  return d.ridgeY + (d.capH - RIDGE_RADIUS) / d.cos + RIDGE_RADIUS;
+  return d.ridgeY + (d.capH - d.ridgeR) / d.cos + d.ridgeR;
 }
 
 /**
  * Cross-section (world z, y) of a ridge tile: legs lying on both slopes,
- * rounded over the apex, solid down to the deck so nothing shows beneath.
+ * rolled over the apex, solid down to the deck so nothing shows beneath.
  * Each point carries whether its normal should be smoothed.
  */
 function ridgeProfile(d: RoofDims): ProfilePoint[] {
-  const R = RIDGE_RADIUS;
+  const R = d.ridgeR;
   const pitch = Math.atan(d.tan);
   const yc = d.ridgeY + (d.capH - R) / d.cos;
   const legTop = toWorld(d, d.capZ, d.capH);
@@ -770,7 +1021,7 @@ function ridgeProfile(d: RoofDims): ProfilePoint[] {
   const out: ProfilePoint[] = [];
   out.push({ p: [-legBottom[0], legBottom[1]], smooth: false });
   out.push({ p: [-legTop[0], legTop[1]], smooth: false });
-  const steps = 8;
+  const steps = 10;
   for (let k = 0; k <= steps; k++) {
     const phi = -pitch + (2 * pitch * k) / steps;
     out.push({ p: [R * Math.sin(phi), yc + R * Math.cos(phi)], smooth: true });
@@ -787,34 +1038,49 @@ function buildRidge(d: RoofDims, colors: RoofColors, rng: Rng): PartBuilder {
   const pivot: [number, number] = [0, d.ridgeY + d.deck / d.cos];
   const xHi = d.xEnd + BARGE_T - 0.004;
 
-  // Runs of ridge tiles, interrupted by a chimney sitting on the ridge.
-  const runs: [number, number][] = [[-xHi, xHi]];
-  const c = d.layout.chimney;
-  const capHalf = toWorld(d, d.capZ, d.capH)[0];
-  if (c && c.z - c.sz / 2 < capHalf && c.z + c.sz / 2 > -capHalf) {
-    const a = c.x - d.cx - c.sx / 2 - CHIMNEY_MARGIN;
-    const e = c.x - d.cx + c.sx / 2 + CHIMNEY_MARGIN;
-    runs.splice(0, 1, [-xHi, a], [e, xHi]);
+  // Runs of ridge tiles, interrupted wherever a roof hole crosses the ridge.
+  // (A stack standing just off the ridge keeps the cap: it dies into its face.)
+  let runs: [number, number][] = [[-xHi, xHi]];
+  for (const h of d.layout.roof.holes) {
+    if (h.z0 >= 0.02 || h.z1 <= -0.02) continue;
+    const g = RIDGE_GAP[h.kind];
+    const a = h.x0 - d.cx - g;
+    const e = h.x1 - d.cx + g;
+    runs = runs.flatMap(([lo, hi]): [number, number][] =>
+      e <= lo || a >= hi ? [[lo, hi]] : ([[lo, Math.min(hi, a)], [Math.max(lo, e), hi]] as [number, number][]).filter(([p, q]) => q > p),
+    );
   }
 
   const pieceLen = 0.4;
   const overlap = 0.07;
-  const taper = 0.06;
   const canon = sideFrame(d, 1);
   const pieces: RidgePiece[] = [];
   for (const [lo, hi] of runs) {
     const runLen = hi - lo;
     if (runLen < 0.12) continue;
-    // Lay from +x to -x; each piece's wide end covers the previous piece's narrow end.
+    // Lay from +x to -x; each piece's wide collar covers the previous piece's narrow end.
     const n = Math.max(1, Math.ceil((runLen - overlap) / (pieceLen - overlap)));
     const len = n === 1 ? runLen : pieceLen;
     const step = n === 1 ? 0 : (runLen - len) / (n - 1);
+    const collar = overlap + 0.012;
+    const rings: [number, number][] =
+      len > collar + 0.08
+        ? [
+            [0, 1],
+            [collar, 1],
+            [collar + 0.016, 0.93],
+            [len, 0.91],
+          ]
+        : [
+            [0, 1],
+            [len, 0.96],
+          ];
+    const geo = sweepX(profile, rings, pivot);
     for (let i = 0; i < n; i++) {
       const xStart = hi - i * step;
       const lift = sagAt(d, xStart - len / 2) + rng.jitter(0.003);
-      const geo = sweepX(profile, len, taper, pivot);
       const m = mul(canon, mat4(xStart, lift, 0));
-      b.add(geo, 'roof', vary(colors.ridge, rng, 0.018, 0.02, 0.004), m);
+      b.add(geo, 'roof', vary(colors.ridge, rng, 0.022, 0.02, 0.004), m);
       pieces.push({ x0: xStart - len, x1: xStart, lift });
     }
   }
@@ -919,11 +1185,12 @@ function prismX(profile: [number, number][], x0: number, x1: number, bevel = 0):
 }
 
 /**
- * Sweep a (z, y) profile along -x for `len` (starting at x = 0), shrinking it
- * towards `pivot` by `taper` at the far end. Smooth profile points get
- * averaged normals (round surfaces); the others stay crisp.
+ * Sweep a (z, y) profile along -x through `rings` ([distance, scale] pairs,
+ * starting at distance 0), scaling it towards `pivot` at each ring. Smooth
+ * profile points get averaged normals (round surfaces); the others stay
+ * crisp; a sharp change of scale between two rings reads as a step.
  */
-function sweepX(profile: ProfilePoint[], len: number, taper: number, pivot: [number, number]): THREE.BufferGeometry {
+function sweepX(profile: ProfilePoint[], rings: [number, number][], pivot: [number, number]): THREE.BufferGeometry {
   let pts = profile;
   const area = pts.reduce((s, a, i) => {
     const c = pts[(i + 1) % pts.length];
@@ -932,7 +1199,6 @@ function sweepX(profile: ProfilePoint[], len: number, taper: number, pivot: [num
   if (area < 0) pts = [...pts].reverse(); // counter-clockwise in (z, y)
   const n = pts.length;
   const scaled = (p: [number, number], s: number): [number, number] => [pivot[0] + (p[0] - pivot[0]) * s, pivot[1] + (p[1] - pivot[1]) * s];
-  const s1 = 1 - taper;
 
   // Edge normals (outward for a counter-clockwise profile).
   const edgeN = pts.map((a, i) => {
@@ -942,44 +1208,57 @@ function sweepX(profile: ProfilePoint[], len: number, taper: number, pivot: [num
     const l = Math.hypot(dz, dy) || 1;
     return [dy / l, -dz / l];
   });
+  const normalAt = (k: number, edge: number) => {
+    if (!pts[k].smooth) return edgeN[edge];
+    const prev = edgeN[(k + n - 1) % n];
+    const next = edgeN[k];
+    const l = Math.hypot(prev[0] + next[0], prev[1] + next[1]) || 1;
+    return [(prev[0] + next[0]) / l, (prev[1] + next[1]) / l];
+  };
 
   const pos: number[] = [];
   const nor: number[] = [];
   // Profile coords (z, y) at sweep distance s → world (x = -s, y, z).
   const push = (p: [number, number], s: number, nz: number, ny: number, nx: number) => {
+    const l = Math.hypot(nx, ny, nz) || 1;
     pos.push(-s, p[1], p[0]);
-    nor.push(nx, ny, nz);
+    nor.push(nx / l, ny / l, nz / l);
   };
-  for (let i = 0; i < n; i++) {
-    const i2 = (i + 1) % n;
-    const normalAt = (k: number, edge: number) => {
-      if (!pts[k].smooth) return edgeN[edge];
-      const prev = edgeN[(k + n - 1) % n];
-      const next = edgeN[k];
-      const l = Math.hypot(prev[0] + next[0], prev[1] + next[1]) || 1;
-      return [(prev[0] + next[0]) / l, (prev[1] + next[1]) / l];
-    };
-    const na = normalAt(i, i);
-    const nb = normalAt(i2, i);
-    const a0 = pts[i].p;
-    const b0 = pts[i2].p;
-    const a1 = scaled(a0, s1);
-    const b1 = scaled(b0, s1);
-    // Two triangles (a0, b0, b1), (a0, b1, a1); outward for a CCW profile swept along -x.
-    push(a0, 0, na[0], na[1], 0);
-    push(b0, 0, nb[0], nb[1], 0);
-    push(b1, len, nb[0], nb[1], 0);
-    push(a0, 0, na[0], na[1], 0);
-    push(b1, len, nb[0], nb[1], 0);
-    push(a1, len, na[0], na[1], 0);
+  for (let r = 0; r + 1 < rings.length; r++) {
+    const [s0, k0] = rings[r];
+    const [s1, k1] = rings[r + 1];
+    // Surface S(s, u) = pivot + q(u)·k(s): its normal leans along x by k'·(q·ν).
+    const kp = (k1 - k0) / Math.max(1e-6, s1 - s0);
+    for (let i = 0; i < n; i++) {
+      const i2 = (i + 1) % n;
+      const na = normalAt(i, i);
+      const nb = normalAt(i2, i);
+      const qa = [pts[i].p[0] - pivot[0], pts[i].p[1] - pivot[1]];
+      const qb = [pts[i2].p[0] - pivot[0], pts[i2].p[1] - pivot[1]];
+      const xa = kp * (qa[0] * na[0] + qa[1] * na[1]);
+      const xb = kp * (qb[0] * nb[0] + qb[1] * nb[1]);
+      const a0 = scaled(pts[i].p, k0);
+      const b0 = scaled(pts[i2].p, k0);
+      const a1 = scaled(pts[i].p, k1);
+      const b1 = scaled(pts[i2].p, k1);
+      // Two triangles (a0, b0, b1), (a0, b1, a1); outward for a CCW profile swept along -x.
+      push(a0, s0, na[0], na[1], xa);
+      push(b0, s0, nb[0], nb[1], xb);
+      push(b1, s1, nb[0], nb[1], xb);
+      push(a0, s0, na[0], na[1], xa);
+      push(b1, s1, nb[0], nb[1], xb);
+      push(a1, s1, na[0], na[1], xa);
+    }
   }
 
   // End caps.
   const contour = pts.map((q) => new THREE.Vector2(q.p[0], q.p[1]));
   const tris = THREE.ShapeUtils.triangulateShape(contour, []);
+  const first = rings[0];
+  const last = rings[rings.length - 1];
   for (const [s, sc, facing] of [
-    [0, 1, 1],
-    [len, s1, -1],
+    [first[0], first[1], 1],
+    [last[0], last[1], -1],
   ] as const) {
     for (const tri of tris) {
       let [i0, i1, i2] = tri;
@@ -1102,9 +1381,9 @@ function topWall(layout: HouseLayout, side: Side): WallSpec {
 }
 
 /**
- * Would a roof timber over u ∈ [u0, u1] clash with an opening's lintel, its
- * shutters or a door canopy? `yLow(w)` is the timber's lowest point at
- * distance w in front of the wall face.
+ * Would a roof timber over u ∈ [u0, u1] clash with an opening's lintel or its
+ * shutters? `yLow(w)` is the timber's lowest point at distance w in front of
+ * the wall face. (The door hood has its own zone, `layout.doorHood`.)
  */
 function blockedByOpening(wall: WallSpec, u0: number, u1: number, yLow: (w: number) => number): boolean {
   const overlaps = (a: number, b: number) => u0 < b && u1 > a;
@@ -1115,8 +1394,6 @@ function blockedByOpening(wall: WallSpec, u0: number, u1: number, yLow: (w: numb
     // Open shutters beside the window, up to w ≈ 0.16, as tall as the opening.
     const half = (o.u1 - o.u0) / 2;
     if (o.shutters && overlaps(o.u0 - half - 0.08, o.u1 + half + 0.08) && yLow(0.16) < o.y1 + 0.03) return true;
-    // A door may get a canopy above it.
-    if (o.kind === 'door' && overlaps(s.u0 - 0.45, s.u1 + 0.45) && yLow(0.6) < s.y1 + 0.5) return true;
     return false;
   });
 }
@@ -1131,4 +1408,9 @@ function shade(color: THREE.ColorRepresentation, dl: number): THREE.Color {
 
 function clamp(v: number, a: number, b: number): number {
   return Math.max(a, Math.min(b, v));
+}
+
+function smoothstep(v: number, a: number, b: number): number {
+  const t = clamp((v - a) / (b - a), 0, 1);
+  return t * t * (3 - 2 * t);
 }

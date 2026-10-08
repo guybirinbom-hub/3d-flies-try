@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { PartBuilder, mix, vary } from '../builder';
 import { OUTWARD, wallExplode } from '../explode';
 import type { PartDef } from '../house';
-import { hitsOpening, type HouseLayout, type Rect, type StoreySpec, type WallSpec } from '../layout';
+import { type HouseLayout, type Opening, type Rect, type StoreySpec, type WallSpec, hitsOpening } from '../layout';
 import type { Rng } from '../rng';
 
 /**
@@ -68,6 +68,20 @@ const W = {
 const TUCK = 0.015;
 /** Narrowest plaster panel worth keeping next to a post. */
 const MIN_PANEL = 0.22;
+/**
+ * How far the openings part's window/door posts reach into the hole (its
+ * `LIP`). The posts beside an opening belong to the openings part inside the
+ * surround; this part continues them above and below it on the same columns.
+ */
+const OPENING_LIP = 0.012;
+
+/** The two post columns beside an opening (u-ranges), shared with the openings part. */
+function postColumns(o: Opening): [[number, number], [number, number]] {
+  return [
+    [o.surround.u0, o.u0 + OPENING_LIP],
+    [o.u1 - OPENING_LIP, o.surround.u1],
+  ];
+}
 
 interface Dims {
   /** Width of posts and studs. */
@@ -89,7 +103,7 @@ interface Dims {
 }
 
 type CornerStyle = 'k' | 'strebe' | 'feet';
-type PanelStyle = 'cross' | 'vee' | 'diag' | 'none';
+type PanelStyle = 'cross' | 'vee' | 'diag' | 'knees' | 'none';
 
 interface FrameStyle {
   /** Bracing in the bays next to the corner posts. */
@@ -98,6 +112,8 @@ interface FrameStyle {
   parapet: PanelStyle;
   /** Tall middle panels between the rails of windowless bays. */
   middle: PanelStyle;
+  /** Tall panels above the window heads (the knee wall of a top storey). */
+  upper: PanelStyle;
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +396,11 @@ class Carpenter {
         ['cross', 3],
         ['diag', 3],
       ] as const),
+      upper: s.weighted([
+        ['knees', 4],
+        ['vee', 2],
+        ['cross', 2],
+      ] as const),
     };
   }
 
@@ -530,6 +551,13 @@ interface Bay {
   b: number;
   /** -1: a corner post is on the left (low u); 1: on the right; 0: none. */
   corner: -1 | 0 | 1;
+  /**
+   * The bay ends at an opening's surround on the left / right. There the
+   * openings part's post (and this part's stubs above and below it) bound the
+   * bay; rails and braces butt against the surround edge instead of tucking.
+   */
+  holeL: boolean;
+  holeR: boolean;
 }
 
 interface Hole {
@@ -537,11 +565,14 @@ interface Hole {
   b: number;
   y0: number;
   y1: number;
+  openings: Opening[];
 }
 
 interface Rails {
   low: [number, number] | null;
   high: [number, number] | null;
+  /** An extra rail half-way up a tall knee wall above the window heads. */
+  knee: [number, number] | null;
 }
 
 function frameWall(c: Carpenter, st: StoreySpec, wall: WallSpec, yBottom: number, yTop: number, plateH: number): void {
@@ -559,14 +590,14 @@ function frameWall(c: Carpenter, st: StoreySpec, wall: WallSpec, yBottom: number
 
   const rails = railsFor(wall, st, y0, y1, d);
   for (const bay of bays) fillBay(c, wall, bay, y0, y1, rails);
-  for (const h of holes) fillAroundOpening(c, wall, h, y0);
+  for (const h of holes) for (const o of h.openings) fillAroundOpening(c, wall, o, y0, y1, rails);
 }
 
 /** Opening surrounds within the storey as u-intervals (merged if they touch), sorted. */
 function openingHoles(wall: WallSpec, yBottom: number, yTop: number): Hole[] {
   const hs = wall.openings
     .filter((o) => o.surround.y0 < yTop && o.surround.y1 > yBottom)
-    .map((o) => ({ a: o.surround.u0, b: o.surround.u1, y0: o.surround.y0, y1: o.surround.y1 }))
+    .map((o) => ({ a: o.surround.u0, b: o.surround.u1, y0: o.surround.y0, y1: o.surround.y1, openings: [o] }))
     .sort((p, q) => p.a - q.a);
   const out: Hole[] = [];
   for (const h of hs) {
@@ -575,7 +606,8 @@ function openingHoles(wall: WallSpec, yBottom: number, yTop: number): Hole[] {
       last.b = Math.max(last.b, h.b);
       last.y0 = Math.min(last.y0, h.y0);
       last.y1 = Math.max(last.y1, h.y1);
-    } else out.push({ ...h });
+      last.openings.push(...h.openings);
+    } else out.push({ ...h, openings: [...h.openings] });
   }
   return out;
 }
@@ -583,13 +615,16 @@ function openingHoles(wall: WallSpec, yBottom: number, yTop: number): Hole[] {
 interface Post {
   a: number;
   b: number;
-  /** Studs may lean a touch; posts next to openings stay plumb. */
+  /** Studs may lean a touch; filler posts stay plumb. */
   stud: boolean;
 }
 
 /**
- * Lay out the full-height posts between the corner posts: one each side of
- * every opening, then studs so no plaster bay is wider than `maxPanel`.
+ * Lay out the full-height posts between the corner posts and the openings.
+ * The posts beside an opening are the openings part's (inside the surround)
+ * plus this part's stubs above and below it, so the free intervals between
+ * surrounds only get studs, keeping every plaster bay narrower than
+ * `maxPanel`. Slivers too narrow for a panel are filled with a post.
  * Returns the posts and the plaster bays between them.
  */
 function placePosts(c: Carpenter, holes: Hole[], ua: number, ub: number): { posts: Post[]; bays: Bay[] } {
@@ -611,53 +646,18 @@ function placePosts(c: Carpenter, holes: Hole[], ua: number, ub: number): { post
 
   for (const f of free) {
     const w = f.b - f.a;
-    const needL = f.left === 'hole';
-    const needR = f.right === 'hole';
-    const nReq = Number(needL) + Number(needR);
-    const cornerSide: Bay['corner'] = f.left === 'corner' ? -1 : f.right === 'corner' ? 1 : 0;
-    if (w < 0.12) {
-      // A sliver between two openings (or an opening and a corner): fill it.
-      if (nReq > 0 && w > 0.02) posts.push({ a: f.a, b: f.b, stud: false });
+    if (w < MIN_PANEL) {
+      // A sliver between an opening and a corner post or another opening: fill it.
+      if (w > 0.02) posts.push({ a: f.a, b: f.b, stud: false });
       continue;
-    }
-    if (w < nReq * P + MIN_PANEL) {
-      if (nReq === 2) {
-        // Between two close openings: one wide post, or a pair of posts.
-        if (w <= 0.45) posts.push({ a: f.a, b: f.b, stud: false });
-        else {
-          const m = (f.a + f.b) / 2;
-          posts.push({ a: f.a, b: m, stud: false }, { a: m, b: f.b, stud: false });
-        }
-      } else if (nReq === 1) {
-        if (w - P < 0.12) posts.push({ a: f.a, b: f.b, stud: false });
-        else if (needL) {
-          posts.push({ a: f.a, b: f.a + P, stud: false });
-          bays.push({ a: f.a + P, b: f.b, corner: cornerSide });
-        } else {
-          posts.push({ a: f.b - P, b: f.b, stud: false });
-          bays.push({ a: f.a, b: f.b - P, corner: cornerSide });
-        }
-      } else bays.push({ a: f.a, b: f.b, corner: cornerSide });
-      continue;
-    }
-    let a = f.a;
-    let b = f.b;
-    if (needL) {
-      posts.push({ a, b: a + P, stud: false });
-      a += P;
-    }
-    if (needR) {
-      posts.push({ a: b - P, b, stud: false });
-      b -= P;
     }
     // Studs, evenly spaced.
-    const span = b - a;
-    const n = Math.max(0, Math.ceil((span - c.d.maxPanel) / (c.d.maxPanel + P)));
-    const bw = (span - n * P) / (n + 1);
+    const n = Math.max(0, Math.ceil((w - c.d.maxPanel) / (c.d.maxPanel + P)));
+    const bw = (w - n * P) / (n + 1);
     for (let k = 0; k <= n; k++) {
-      const u = a + k * (bw + P);
+      const u = f.a + k * (bw + P);
       const corner: Bay['corner'] = k === 0 && f.left === 'corner' ? -1 : k === n && f.right === 'corner' ? 1 : 0;
-      bays.push({ a: u, b: u + bw, corner });
+      bays.push({ a: u, b: u + bw, corner, holeL: k === 0 && f.left === 'hole', holeR: k === n && f.right === 'hole' });
       if (k < n) posts.push({ a: u + bw, b: u + bw + P, stud: true });
     }
   }
@@ -676,20 +676,23 @@ function postPoly(c: Carpenter, p: Post, y0: number, y1: number): Poly {
 }
 
 /**
- * Rail heights for a wall: a low rail whose top lines up with the window
- * bottoms (the sill line) and a high rail matching the lintels, so the
- * horizontals run on around the house. Dropped where they would leave
- * slivers of plaster.
+ * Rail heights for a wall: a low rail level with the window sill rails (the
+ * openings part's beam under each window, the surround's bottom band) and a
+ * high rail level with the lintels (up to the surround's top), so the
+ * horizontals run on through the window cases and around the house. A tall
+ * knee wall above the window heads gets a third rail half-way up. Rails are
+ * dropped where they would leave slivers of plaster.
  */
 function railsFor(wall: WallSpec, st: StoreySpec, y0: number, y1: number, d: Dims): Rails {
   const ref =
     wall.openings.find((o) => o.kind === 'window') ??
     st.walls.flatMap((w) => w.openings).find((o) => o.kind === 'window');
   const lowTop = ref ? ref.y0 : st.floorY + (st.index === 0 ? 0.85 : 0.8);
+  const lowBot = ref ? ref.surround.y0 : lowTop - d.rail;
   const highBot = ref ? ref.lintel.y0 : lowTop + 1.2;
-  const highTop = ref ? ref.lintel.y1 : highBot + 0.2;
+  const highTop = ref ? ref.surround.y1 : highBot + 0.22;
 
-  let low: Rails['low'] = [lowTop - d.rail, lowTop];
+  let low: Rails['low'] = [lowBot, lowTop];
   if (low[0] - y0 < 0.18 || y1 - low[1] < 0.45) low = null;
 
   let high: Rails['high'] = [highBot, highTop];
@@ -698,62 +701,116 @@ function railsFor(wall: WallSpec, st: StoreySpec, y0: number, y1: number, d: Dim
   else if (gap < 0.07) high = [highBot, y1 + TUCK]; // close the sliver: run up under the plate
   else if (gap < 0.16) high = null;
   if (high && high[0] - (low ? low[1] : y0) < 0.4) high = null;
-  return { low, high };
+
+  // Knee rail: splits a tall band above the window heads into two panels.
+  let knee: Rails['knee'] = null;
+  if (high && gap >= 0.78) {
+    const m = high[1] + gap * 0.5;
+    knee = [m - d.rail / 2, m + d.rail / 2];
+  }
+  return { low, high, knee };
 }
 
 /** Rails, braces and panel decoration in a plaster bay between two posts. */
 function fillBay(c: Carpenter, wall: WallSpec, bay: Bay, y0: number, y1: number, rails: Rails): void {
   const w = bay.b - bay.a;
   if (w < 0.12) return;
-  const railRects = [rails.low, rails.high].filter((r): r is [number, number] => !!r);
+  const railRects = [rails.low, rails.high, rails.knee].filter((r): r is [number, number] => !!r);
   const bayRect: Rect = { u0: bay.a, u1: bay.b, y0, y1 };
+  const tuckL = bay.holeL ? 0 : TUCK;
+  const tuckR = bay.holeR ? 0 : TUCK;
+  const outward = (bay.a + bay.b) / 2 < wall.length / 2 ? -1 : 1;
 
   // Bays next to a corner post get the corner bracing; the rails butt into it.
   const cornerBraces = bay.corner !== 0 ? cornerBracing(c, bay, y0, y1, rails) : [];
   if (cornerBraces.length) {
-    emitBraces(c, wall, cornerBraces, grow(bayRect, TUCK));
+    emitBraces(c, wall, cornerBraces, grow(bayRect, tuckL, tuckR, TUCK, TUCK));
     for (const [ra, rb] of railRects) {
-      let pieces: Poly[] = [railPoly(c, bay, ra, rb)];
+      let pieces: Poly[] = [railPoly(c, bay.a - tuckL, bay.b + tuckR, ra, rb)];
       for (const s of cornerBraces) pieces = pieces.flatMap((p) => minusStrip(p, s));
       for (const p of pieces) c.beam(wall, p, W.rail);
     }
     return;
   }
 
-  for (const [ra, rb] of railRects) c.beam(wall, railPoly(c, bay, ra, rb), W.rail);
+  for (const [ra, rb] of railRects) c.beam(wall, railPoly(c, bay.a - tuckL, bay.b + tuckR, ra, rb), W.rail);
 
   // Panels between the rails.
   const cuts = [y0, ...railRects.flat(), y1];
-  const outward = (bay.a + bay.b) / 2 < wall.length / 2 ? -1 : 1;
+  const last = cuts.length - 2;
   for (let i = 0; i + 1 < cuts.length; i += 2) {
     const panel: Rect = { u0: bay.a, u1: bay.b, y0: cuts[i], y1: cuts[i + 1] };
-    const isLow = i === 0 && railRects.length > 0 && rails.low !== null;
+    const isLow = i === 0 && rails.low !== null;
     const isMiddle = i === 2 && rails.low !== null && rails.high !== null;
-    const style = isLow ? c.style.parapet : isMiddle ? c.style.middle : 'none';
-    decoratePanel(c, wall, panel, style, outward, { u0: true, u1: true, y0: true, y1: true });
+    // The band above the window heads (between the high rail and a knee rail, or up to the plate).
+    const isUpper = rails.high !== null && panel.y0 >= rails.high[1] - 1e-6 && (rails.knee ? i === last - 2 : i === last);
+    const style = isLow ? c.style.parapet : isMiddle ? c.style.middle : isUpper ? upperStyle(c, panel) : 'none';
+    decoratePanel(c, wall, panel, style, outward, { u0: !bay.holeL, u1: !bay.holeR, y0: true, y1: true });
   }
 }
 
+/** Decoration for a panel above the window heads: only when it is tall enough to look empty. */
+function upperStyle(c: Carpenter, r: Rect): PanelStyle {
+  return r.y1 - r.y0 >= 0.42 ? c.style.upper : 'none';
+}
+
 /**
- * A rail across a bay, tucked under the posts at both ends. Its top and
- * bottom edges wander by a few millimetres, like hand-hewn timber.
+ * A rail across a bay from u0 to u1 (callers add the tuck under posts).
+ * Its top and bottom edges wander by a few millimetres, like hand-hewn timber.
  */
-function railPoly(c: Carpenter, bay: Bay, y0: number, y1: number): Poly {
+function railPoly(c: Carpenter, u0: number, u1: number, y0: number, y1: number): Poly {
   const j = () => c.rng.jitter(0.004);
   return [
-    [bay.a - TUCK, y0 + j()],
-    [bay.b + TUCK, y0 + j()],
-    [bay.b + TUCK, y1 + j()],
-    [bay.a - TUCK, y1 + j()],
+    [u0, y0 + j()],
+    [u1, y0 + j()],
+    [u1, y1 + j()],
+    [u0, y1 + j()],
   ];
 }
 
-/** The parapet panel under a window, between its posts. */
-function fillAroundOpening(c: Carpenter, wall: WallSpec, h: Hole, y0: number): void {
-  const outward = (h.a + h.b) / 2 < wall.length / 2 ? -1 : 1;
-  if (h.y0 - y0 > 0.25) {
-    // Parapet under a window: bounded by posts and sill; the top is the surround (no tucking).
-    decoratePanel(c, wall, { u0: h.a, u1: h.b, y0, y1: h.y0 }, c.style.parapet, outward, { u0: true, u1: true, y0: true, y1: false });
+/**
+ * Above and below an opening's surround: stubs that continue the opening's
+ * posts down to the sill beam and up to the plate, with the rails that pass
+ * there and the parapet decoration between them. A band too thin for a
+ * panel is closed with one beam across the surround's width instead.
+ */
+function fillAroundOpening(c: Carpenter, wall: WallSpec, o: Opening, y0: number, y1: number, rails: Rails): void {
+  const s = o.surround;
+  const cols = postColumns(o);
+  const outward = (s.u0 + s.u1) / 2 < wall.length / 2 ? -1 : 1;
+  const railRects = [rails.low, rails.high, rails.knee].filter((r): r is [number, number] => !!r);
+
+  for (const where of ['below', 'above'] as const) {
+    const ya = where === 'below' ? y0 : Math.max(s.y1, y0);
+    const yb = where === 'below' ? Math.min(s.y0, y1) : y1;
+    const h = yb - ya;
+    if (h <= 0.004) continue;
+    if (h < 0.1) {
+      // A thin band: one filler beam under the sill rail / over the lintel, tucked under the sill beam / plate.
+      c.beam(wall, rectPoly(s.u0, s.u1, where === 'below' ? ya - TUCK : ya, where === 'above' ? yb + TUCK : yb), W.rail);
+      continue;
+    }
+    for (const [a, b] of cols) c.beam(wall, rectPoly(a, b, ya, yb), W.post);
+    const ua = cols[0][1];
+    const ub = cols[1][0];
+    if (ub - ua < 0.12) continue;
+    const inside = railRects.filter(([ra, rb]) => ra >= ya + 0.08 && rb <= yb - 0.08);
+    for (const [ra, rb] of inside) c.beam(wall, railPoly(c, ua - TUCK, ub + TUCK, ra, rb), W.rail);
+    const cuts = [ya, ...inside.flat(), yb];
+    for (let i = 0; i + 1 < cuts.length; i += 2) {
+      const panel: Rect = { u0: ua, u1: ub, y0: cuts[i], y1: cuts[i + 1] };
+      const first = i === 0;
+      const lastPanel = i + 2 >= cuts.length - 1;
+      // Bounded by the surround (no tucking) on the side that faces the opening.
+      const tuck: TuckSides = { u0: true, u1: true, y0: !(where === 'above' && first), y1: !(where === 'below' && lastPanel) };
+      // Under a window: the parapet. Above: the band over the window heads
+      // (up to the plate, or to the knee rail when there is one).
+      let style: PanelStyle = 'none';
+      const overHeads = panel.y0 >= (rails.high ? rails.high[1] : s.y1) - 1e-6;
+      if (where === 'below' && first) style = c.style.parapet;
+      else if (where === 'above' && overHeads && (rails.knee ? !lastPanel : lastPanel)) style = upperStyle(c, panel);
+      decoratePanel(c, wall, panel, style, outward, tuck);
+    }
   }
 }
 
@@ -812,6 +869,19 @@ function decoratePanel(c: Carpenter, wall: WallSpec, r: Rect, style: PanelStyle,
     const lowU = outward < 0 ? r.u1 : r.u0;
     const highU = outward < 0 ? r.u0 : r.u1;
     emitBraces(c, wall, [{ a: [lowU, r.y0], b: [highU, r.y1 + jit()], width: bw }], clip);
+  } else if (style === 'knees') {
+    // Short head braces ("Kopfbänder") from both side posts up to the beam above.
+    const len = Math.min(0.5, w * 0.36, h * 0.85);
+    if (len < 0.24) return;
+    emitBraces(
+      c,
+      wall,
+      [
+        { a: [r.u0, r.y1 - len], b: [r.u0 + len, r.y1 + jit() * 0.5], width: bw * 0.85 },
+        { a: [r.u1, r.y1 - len], b: [r.u1 - len, r.y1 + jit() * 0.5], width: bw * 0.85 },
+      ],
+      clip,
+    );
   }
 }
 
@@ -844,7 +914,8 @@ function cornerBracing(c: Carpenter, bay: Bay, y0: number, y1: number, rails: Ra
       // Short foot and head braces against the corner post.
       const len = Math.min(0.62, w * 0.85, (rails.low ? rails.low[0] - y0 : h * 0.3) + 0.05);
       if (len < 0.3) return [];
-      const lh = Math.min(0.62, w * 0.85, rails.high ? y1 - rails.high[1] + 0.05 : 0.62);
+      const topRail = rails.knee ?? rails.high;
+      const lh = Math.min(0.62, w * 0.85, topRail ? y1 - topRail[1] + 0.05 : 0.62);
       const out: Strip[] = [{ a: [uc, y0 + len], b: [uc + dir * len, y0], width: bw * 0.9 }];
       if (lh >= 0.3) out.push({ a: [uc, y1 - lh], b: [uc + dir * lh, y1], width: bw * 0.9 });
       return out;
@@ -869,8 +940,11 @@ function emitBraces(c: Carpenter, wall: WallSpec, braces: Strip[], clip: Rect): 
 
 /**
  * Framing in the gable triangle above the top plate: edge rafters along the
- * roof line, a king post (or posts around the attic window), studs, a collar
- * and struts. Everything stays 2 cm below the roof underside.
+ * roof line, a king post, studs, a collar and struts, all clipped 2 cm below
+ * the roof underside. Attic windows keep their post columns (the openings
+ * part builds the posts beside the window; here they continue down to the
+ * plate and up to the rafters); any member crossing a window's surround is
+ * cut around it.
  */
 function frameGable(c: Carpenter, wall: WallSpec): void {
   const g = wall.gable;
@@ -882,12 +956,12 @@ function frameGable(c: Carpenter, wall: WallSpec): void {
   const tan = (g.apexY - base) / mid;
   const cos = 1 / Math.sqrt(1 + tan * tan);
   const roofGap = 0.02;
-  const attic = wall.openings.find((o) => o.kind === 'attic');
+  const attics = wall.openings.filter((o) => o.kind === 'attic');
+  const surrounds = attics.map((o) => o.surround);
 
-  // Rafter depth (vertical), thinner if the attic window's lintel comes close.
+  // Rafter depth (vertical), thinner if an attic window's lintel comes close.
   let rv = d.rafter / cos;
-  if (attic) {
-    const s = attic.surround;
+  for (const s of surrounds) {
     const clearance = Math.min(gableLine(s.u0), gableLine(s.u1)) - roofGap - s.y1;
     rv = clamp(Math.min(rv, clearance - 0.01), 0.1, rv);
   }
@@ -910,45 +984,68 @@ function frameGable(c: Carpenter, wall: WallSpec): void {
 
   const P = d.post;
   const H = g.apexY - base;
-  // The collar sits about half-way up. With an attic window it moves up to the
-  // window head (doubling as its header) unless it clears the window comfortably.
-  let collarY = base + H * 0.5;
-  if (attic && collarY < attic.surround.y1 + 0.3) collarY = attic.surround.y1;
-  const hasCollar = H > 1.3 && gableLine(mid) - below - (collarY + d.collar) > 0.25;
 
-  // Central element: a king post, or posts either side of the attic window
-  // with a short king post standing on the collar (or the window head).
-  let uFoot: number; // outer edge of the central element at the base
-  if (attic) {
-    const s = attic.surround;
-    c.beam(wall, inner(rectPoly(s.u0 - P, s.u0, base, g.apexY)), W.post);
-    c.beam(wall, inner(rectPoly(s.u1, s.u1 + P, base, g.apexY)), W.post);
-    uFoot = s.u0 - P;
-    const kp0 = hasCollar ? collarY : s.y1;
-    const kp = inner(rectPoly(mid - P / 2, mid + P / 2, kp0, g.apexY));
-    if (kp.length && bounds(kp).y1 - kp0 > 0.18) c.beam(wall, kp, W.post);
-  } else {
-    c.beam(wall, inner(rectPoly(mid - P / 2, mid + P / 2, base, g.apexY)), W.post);
-    uFoot = mid - P / 2;
-  }
+  /** A vertical member over [a, b] from the plate to the rafters, cut around window surrounds. */
+  const vertical = (a: number, b: number, minH: number): void => {
+    let spans: [number, number][] = [[base, g.apexY]];
+    for (const s of surrounds) {
+      if (s.u0 >= b - 1e-6 || s.u1 <= a + 1e-6) continue;
+      spans = spans.flatMap(([y0, y1]): [number, number][] => {
+        if (s.y1 <= y0 || s.y0 >= y1) return [[y0, y1]];
+        const out: [number, number][] = [];
+        if (s.y0 > y0) out.push([y0, s.y0]);
+        if (s.y1 < y1) out.push([s.y1, y1]);
+        return out;
+      });
+    }
+    for (const [y0, y1] of spans) {
+      const piece = inner(rectPoly(a, b, y0, y1));
+      if (piece.length && bounds(piece).y1 - bounds(piece).y0 > minH) c.beam(wall, piece, W.post);
+    }
+  };
 
-  // Studs, symmetric about the apex, so the lower panels stay narrow.
-  const n = Math.max(1, Math.ceil(uFoot / d.maxPanel));
-  for (let k = 1; k < n; k++) {
-    const u = uFoot - (k * uFoot) / n;
-    for (const uc of [u, L - u]) {
-      const stud = inner(rectPoly(uc - P / 2, uc + P / 2, base, g.apexY));
-      if (stud.length && bounds(stud).y1 - base > 0.4) c.beam(wall, stud, W.post);
+  // Columns: each attic window's posts, and a king post unless a window sits on the axis.
+  const cols: [number, number][] = [];
+  for (const o of attics) cols.push(...postColumns(o));
+  const onAxis = attics.find((o) => o.surround.u0 < mid && o.surround.u1 > mid);
+  if (!onAxis) cols.push([mid - P / 2, mid + P / 2]);
+  for (const [a, b] of cols) vertical(a, b, 0.05);
+
+  // Studs, symmetric about the apex, so the panels at the plate stay narrow:
+  // evenly spaced in each free stretch of the left half, mirrored.
+  const left = cols.filter(([a]) => a < mid).sort((p, q) => p[0] - q[0]);
+  const edges = [0, ...left.flatMap(([a, b]) => [a, b]), onAxis ? onAxis.surround.u0 : mid - P / 2];
+  for (let i = 0; i + 1 < edges.length; i += 2) {
+    const a = edges[i];
+    const b = Math.min(edges[i + 1], mid - P / 2);
+    const span = b - a;
+    if (span <= d.maxPanel) continue;
+    const n = Math.ceil(span / d.maxPanel);
+    for (let k = 1; k < n; k++) {
+      const u = i === 0 ? b - (k * span) / n : a + (k * span) / n;
+      for (const uc of [u, L - u]) {
+        const stud = inner(rectPoly(uc - P / 2, uc + P / 2, base, g.apexY));
+        if (stud.length && bounds(stud).y1 - base > 0.4) vertical(uc - P / 2, uc + P / 2, 0.25);
+      }
     }
   }
 
-  // Collar across the triangle (behind the posts).
+  // The collar sits about half-way up; if that crosses a window it moves up
+  // to the window head (doubling as its header).
+  let collarY = base + H * 0.5;
+  for (const s of [...surrounds].sort((p, q) => p.y1 - q.y1)) {
+    if (collarY < s.y1 + 0.3 && collarY + d.collar > s.y0) collarY = s.y1;
+  }
+  const hasCollar = H > 1.3 && gableLine(mid) - below - (collarY + d.collar) > 0.25;
   if (hasCollar) {
-    const collar = inner(rectPoly(0, L, collarY, collarY + d.collar));
-    if (!attic || !hitsOpening(wall, bounds(collar))) c.beam(wall, collar, W.rail);
+    for (const [a, b] of freeSpans(wall, 0, L, collarY, collarY + d.collar)) {
+      const piece = inner(rectPoly(a, b, collarY, collarY + d.collar));
+      if (piece.length && bounds(piece).u1 - bounds(piece).u0 > 0.2) c.beam(wall, piece, W.rail);
+    }
   }
 
   // Struts from the foot of the central element up to the rafters.
+  const uFoot = onAxis ? onAxis.surround.u0 : mid - P / 2;
   const phi = clamp(Math.PI / 2 - Math.atan(tan), 0.6, 1.0);
   const bw = d.brace;
   for (const side of [-1, 1]) {
@@ -958,7 +1055,7 @@ function frameGable(c: Carpenter, wall: WallSpec): void {
     const b: P2 = [a[0] + side * Math.cos(phi) * 6, base + Math.sin(phi) * 6];
     const limit: Rect = side < 0 ? { u0: 0, u1: footU + TUCK, y0: base - TUCK, y1: g.apexY } : { u0: footU - TUCK, u1: L, y0: base - TUCK, y1: g.apexY };
     const strut = clipRect(inner(stripPoly({ a, b, width: bw }, 0.5)), limit);
-    if (isSolid(strut, 0.02)) c.beam(wall, strut, W.brace);
+    if (isSolid(strut, 0.02) && !hitsOpening(wall, bounds(strut), 0.01)) c.beam(wall, strut, W.brace);
   }
 }
 
