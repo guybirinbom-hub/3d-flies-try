@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
+import { mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { createMaterials } from './gen/materials';
 import type { MatKey } from './gen/builder';
 import { applyPainterly, PAINTERLY } from './gen/painterly';
@@ -194,9 +195,40 @@ function cameraFromUrl(): boolean {
 
 async function exportGLB(): Promise<ArrayBuffer> {
   const exporter = new GLTFExporter();
-  const target = houses.length === 1 ? houses[0].group : world;
-  const result = await exporter.parseAsync(target, { binary: true });
+  const target = exportable(houses.length === 1 ? houses[0].group : world);
+  const result = await exporter.parseAsync(target, { binary: true, onlyVisible: true });
+  target.traverse((o) => {
+    if (o instanceof THREE.Mesh) o.geometry.dispose();
+  });
   return result as ArrayBuffer;
+}
+
+/**
+ * A copy of the scene graph prepared for glTF: vertices welded (the builder
+ * writes flat triangle soup), unit normals, 8-bit vertex colours. Shrinks a
+ * house's .glb several times over.
+ */
+function exportable(src: THREE.Object3D): THREE.Object3D {
+  const root = src.clone(true);
+  root.traverse((o) => {
+    if (!(o instanceof THREE.Mesh)) return;
+    const g = o.geometry.clone() as THREE.BufferGeometry;
+    const n = g.attributes.normal as THREE.BufferAttribute;
+    const v = new THREE.Vector3();
+    for (let i = 0; i < n.count; i++) {
+      v.fromBufferAttribute(n, i);
+      // Degenerate slivers can carry zero normals; glTF wants unit length.
+      if (v.lengthSq() < 1e-12) v.set(0, 1, 0);
+      n.setXYZ(i, ...v.normalize().toArray());
+    }
+    const c = g.attributes.color as THREE.BufferAttribute;
+    const bytes = new Uint8Array(c.count * 3);
+    for (let i = 0; i < c.array.length; i++) bytes[i] = Math.round(THREE.MathUtils.clamp(c.array[i], 0, 1) * 255);
+    g.setAttribute('color', new THREE.BufferAttribute(bytes, 3, true));
+    o.geometry = mergeVertices(g, 1e-4);
+    g.dispose();
+  });
+  return root;
 }
 
 function download(data: ArrayBuffer, name: string): void {
