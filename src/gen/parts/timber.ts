@@ -744,14 +744,16 @@ function fillBay(c: Carpenter, wall: WallSpec, bay: Bay, y0: number, y1: number,
     const isMiddle = i === 2 && rails.low !== null && rails.high !== null;
     // The band above the window heads (between the high rail and a knee rail, or up to the plate).
     const isUpper = rails.high !== null && panel.y0 >= rails.high[1] - 1e-6 && (rails.knee ? i === last - 2 : i === last);
-    const style = isLow ? c.style.parapet : isMiddle ? c.style.middle : isUpper ? upperStyle(c, panel) : 'none';
+    // Very large houses (low detail) keep the parapet bracing and drop the rest.
+    const middle = c.layout.detail >= 0.6 ? c.style.middle : 'none';
+    const style = isLow ? c.style.parapet : isMiddle ? middle : isUpper ? upperStyle(c, panel) : 'none';
     decoratePanel(c, wall, panel, style, outward, { u0: !bay.holeL, u1: !bay.holeR, y0: true, y1: true });
   }
 }
 
 /** Decoration for a panel above the window heads: only when it is tall enough to look empty. */
 function upperStyle(c: Carpenter, r: Rect): PanelStyle {
-  return r.y1 - r.y0 >= 0.42 ? c.style.upper : 'none';
+  return r.y1 - r.y0 >= 0.42 && c.layout.detail >= 0.6 ? c.style.upper : 'none';
 }
 
 /**

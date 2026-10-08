@@ -31,14 +31,20 @@ export const part: PartDef = {
       b.explode = wallExplode(wall, OUTWARD.openings);
       const c: Ctx = { b, wall, layout, pal, look, rng: rng.fork(wall.id) };
       const shutterPlan = planShutters(wall);
+      const dbg = (globalThis as any).__openingsStats as Record<string, number> | undefined;
+      const track = (k: string, f: () => void) => {
+        const t0 = b.triangles;
+        f();
+        if (dbg) dbg[k] = (dbg[k] ?? 0) + b.triangles - t0;
+      };
       for (const o of wall.openings) {
-        buildSurround(c, o);
-        if (o.kind === 'door') buildDoor(c, o);
-        else buildWindow(c, o);
+        track('surround:' + wall.style, () => buildSurround(c, o));
+        if (o.kind === 'door') track('door', () => buildDoor(c, o));
+        else track('window', () => buildWindow(c, o));
         const leaves = shutterPlan.get(o.id);
-        if (leaves) buildShutters(c, o, leaves);
-        if (o.flowerBox && o.sill) buildFlowerBox(c, o);
-        if (o === layout.door) buildHood(c, o);
+        if (leaves) track('shutters:' + c.look.shutterStyle, () => buildShutters(c, o, leaves));
+        if (o.flowerBox && o.sill) track('flowerbox', () => buildFlowerBox(c, o));
+        if (o === layout.door) track('hood', () => buildHood(c, o));
       }
       out.push(b);
     }
@@ -87,6 +93,8 @@ interface Look {
   dressedStone: THREE.Color;
   /** Share of windows with curtains or a pot plant behind the glass. */
   life: number;
+  /** Finer flower balls in the boxes (only when the house has few boxes and full detail). */
+  pompoms: boolean;
   curtains: ('cafe' | 'tieback' | 'valance')[];
   curtainColor: THREE.Color;
 }
@@ -124,6 +132,7 @@ function chooseLook(layout: HouseLayout, rng: Rng): Look {
     boxColor: rng.chance(0.5) ? new THREE.Color(pal.wood) : mix(pal.shutter, pal.wood, 0.25),
     dressedStone: mix(pal.stone, '#efe8dc', 0.3),
     life: rng.range(0.4, 0.6),
+    pompoms: layout.detail >= 0.92 && layout.openings.filter((o) => o.flowerBox && o.sill).length <= 12,
     curtains: rng.weighted([
       [['cafe'], 3],
       [['tieback'], 2],
@@ -177,7 +186,7 @@ function stoneJambs(c: Ctx, o: Opening): void {
   const yA = (o.sill ? o.sill.y0 : o.y0) + 0.02;
   const yB = o.arched ? springY(o) - JOINT / 2 : o.y1 - LIP - JOINT;
   const room = o.u0 - o.lintel.u0; // usable width beside the hole
-  const courses = Math.max(1, Math.round((yB - yA) / 0.27));
+  const courses = Math.max(1, Math.round((yB - yA) / lerp(0.5, 0.27, fine(c))));
   const heights = randomSplit(yB - yA, courses, 0.25, rng);
   let y = yA;
   for (let i = 0; i < courses; i++) {
@@ -372,7 +381,7 @@ function buildWindow(c: Ctx, o: Opening): void {
   // enough to hold the glass set back behind the glazing bars).
   const frame = new THREE.Shape(headOutline(o, -0.01, o.y0 - 0.01));
   frame.holes.push(new THREE.Path(headOutline(o, fw, o.y0 + fw)));
-  slab(c, 'trim', trim, frame, R + GLASS_W - 0.014, R + 0.035, 0.01);
+  slab(c, 'trim', trim, frame, R + GLASS_W - 0.014, R + 0.035, fine(c) < 0.55 ? 0 : 0.01);
 
   // Glass behind the glazing bars, with room for curtains between them.
   const glass = vary(GLASS, rng, 0.04, 0.05, 0.01);
@@ -466,7 +475,7 @@ function windowLife(c: Ctx, o: Opening, L: Light, glass: THREE.Color, transoms: 
   const W = L.u1 - L.u0;
   const curtain = rng.chance(o.kind === 'attic' ? 0.5 : 0.8);
   const plant = !curtain || rng.chance(0.3);
-  const seg = c.layout.detail < 0.75 ? 0.03 : 0.02;
+  const seg = lerp(0.035, 0.02, fine(c));
   if (curtain) {
     let style = rng.pick(look.curtains);
     if (o.arched) style = 'cafe';
@@ -746,7 +755,7 @@ function shutterLeaf(c: Ctx, o: Opening, side: -1 | 1, width: number, base: THRE
   if (style === 'louvred') {
     louvredLeaf(c, ua, ub, ya, yb, base);
   } else {
-    const boards = clamp(Math.round(width / 0.115), 2, 5);
+    const boards = clamp(Math.round((width / 0.115) * lerp(0.5, 1, fine(c))), 2, 5);
     const bw = width / boards;
     for (let i = 0; i < boards; i++) {
       const color = vary(base, rng, 0.04, 0.03, 0.006);
@@ -775,9 +784,9 @@ function shutterLeaf(c: Ctx, o: Opening, side: -1 | 1, width: number, base: THRE
       const heart = extrudeSoft(heartShape((ua + ub) / 2, (lowY + highY) / 2 + h * 0.08, s), front - 0.004, front + 0.003, 0);
       c.b.add(heart, 'wood', mix(base, '#1d140e', 0.82), c.wall.frame);
     }
-    // Strap hinges along the ledges.
+    // Strap hinges along the ledges (left out on very large houses).
     const iron = vary(IRON, rng, 0.03, 0.02, 0);
-    for (const y of [lowY, highY]) {
+    for (const y of fine(c) > 0.3 ? [lowY, highY] : []) {
       const tip = hingeU + side * width * 0.55;
       block(c, 'metal', iron, { u: [Math.min(hingeU, tip), Math.max(hingeU, tip)], y: [y - 0.016, y + 0.016], w: [front + 0.017, front + 0.024] }, 0);
     }
@@ -806,15 +815,18 @@ function louvredLeaf(c: Ctx, ua: number, ub: number, ya: number, yb: number, bas
   block(c, 'wood', mix(base, '#1d140e', 0.6), { u: [ua + stile - 0.005, ub - stile + 0.005], y: [ya + rail, yb - rail], w: [back, back + 0.006] }, 0);
   const slat = mix(base, '#000000', 0.05);
   const slatLen = ub - ua - 2 * stile + 0.01;
+  // Very large houses get single-sided slats (the dark back panel shows between them anyway).
+  const slatGeom =
+    fine(c) < 0.55 ? cached(`slat:${slatLen.toFixed(4)}`, () => new THREE.PlaneGeometry(slatLen, 0.058)) : softBox(slatLen, 0.058, 0.008, 0);
   for (const [y0, y1] of [
     [ya + rail, midY - rail / 2],
     [midY + rail / 2, yb - rail],
   ]) {
-    const n = Math.max(1, Math.floor((y1 - y0) / 0.062));
+    const n = Math.max(1, Math.floor((y1 - y0) / lerp(0.1, 0.062, fine(c))));
     const step = (y1 - y0) / n;
     for (let i = 0; i < n; i++) {
       const m = at(c.wall, (ua + ub) / 2, y0 + (i + 0.5) * step, back + depth / 2, -0.6, 0, 0);
-      c.b.add(softBox(slatLen, 0.058, 0.008, 0), 'wood', slat, m);
+      c.b.add(slatGeom, 'wood', slat, m);
     }
   }
 }
@@ -838,7 +850,8 @@ function heartShape(u: number, y: number, s: number): THREE.Shape {
 
 function buildFlowerBox(c: Ctx, o: Opening): void {
   const { rng } = c;
-  const detail = c.layout.detail;
+  const k = fine(c);
+  const lite = k < 0.55;
   const s = o.sill!;
   const u0 = s.u0 + 0.02;
   const u1 = s.u1 - 0.02;
@@ -870,63 +883,64 @@ function buildFlowerBox(c: Ctx, o: Opening): void {
   const green = () => vary(rng.pick(LEAF_GREENS), rng, 0.05, 0.05, 0.01);
 
   // A low bed of leaves (kept off the wall: nothing outside the surround behind w = 0.08).
-  const n = Math.max(3, Math.round(((u1 - u0) / 0.17) * (0.5 + 0.5 * detail)));
+  const n = Math.max(3, Math.round((u1 - u0) / lerp(0.38, 0.25, k)));
   const step = (u1 - u0) / n;
   for (let i = 0; i < n; i++) {
     const u = u0 + (i + 0.5) * step + rng.jitter(step * 0.2);
     const rad = rng.range(0.055, 0.07);
     const scale = new THREE.Vector3(rng.range(1.15, 1.4), rng.range(0.6, 0.8), rng.range(1.0, 1.2));
     const w = Math.max(rng.range(0.17, 0.23), 0.08 + rad * scale.z * 1.2);
-    addBlob(c, 'foliage', green(), new THREE.Vector3(u, top + rad * 0.25, w), rad, scale, 'clump');
+    addBlob(c, 'foliage', green(), new THREE.Vector3(u, top + rad * 0.25, w), rad, scale, lite ? 'sprig' : 'clump');
   }
 
   // Geranium-like umbels: domes of 3–4.5 cm florets standing above the
   // leaves at the back and tumbling over the front edge, close together so
   // the colour dominates.
-  const umbels = Math.max(4, Math.round(((u1 - u0) / 0.095) * (0.45 + 0.55 * detail)));
-  const florets = detail > 0.7 ? 7 : 5;
+  const umbels = Math.max(4, Math.round((u1 - u0) / lerp(0.17, 0.11, k)));
   const ustep = (u1 - u0) / umbels;
   for (let i = 0; i < umbels; i++) {
     const front = i % 2 === 1;
     const u = u0 + (i + 0.5) * ustep + rng.jitter(ustep * 0.2);
     const centre = front
-      ? new THREE.Vector3(u, top + rng.range(0.02, 0.05), w1 - 0.02 + rng.range(0, 0.02))
-      : new THREE.Vector3(u, top + rng.range(0.09, 0.13), rng.range(0.17, 0.22));
-    umbel(c, centre, florets, bloom());
+      ? new THREE.Vector3(u, top + rng.range(0.03, 0.05), w1 - 0.025 + rng.range(0, 0.02))
+      : new THREE.Vector3(u, top + rng.range(0.09, 0.125), rng.range(0.17, 0.21));
+    umbel(c, centre, bloom());
   }
 
   // Trailing sprigs spilling over the rim, flowering at the tips.
-  const trailing = Math.max(1, Math.round(n * 0.5 * (0.4 + 0.6 * detail)));
+  const trailing = k < 0.25 ? 0 : Math.max(1, Math.round((u1 - u0) / lerp(0.9, 0.4, k)));
   for (let i = 0; i < trailing; i++) {
     const u = u0 + ((i + 0.5) / trailing) * (u1 - u0) + rng.jitter(0.05);
     const leaf = green();
-    const links = detail > 0.7 ? 3 : 2;
+    const links = 2;
     let tip = new THREE.Vector3();
-    for (let k = 0; k < links; k++) {
-      const rad = 0.04 - k * 0.007;
-      tip = new THREE.Vector3(u + rng.jitter(0.015) + k * 0.01, top - 0.01 - k * 0.05, w1 + 0.012 + rad * 0.6 - k * 0.006);
-      addBlob(c, 'foliage', leaf, tip, rad, new THREE.Vector3(1, 1.15, 0.8), 'sprig');
-    }
     const color = bloom();
-    for (let f = 0; f < 2; f++) {
-      const p = tip.clone().add(new THREE.Vector3(rng.jitter(0.025), -0.02 + rng.jitter(0.015), 0.022));
-      addBlob(c, 'flower', color, p, rng.range(0.016, 0.02), new THREE.Vector3(1, 0.9, 0.85), 'floret');
+    for (let k = 0; k < links; k++) {
+      const rad = 0.03 - k * 0.005;
+      tip = new THREE.Vector3(u + rng.jitter(0.015) + k * 0.01, top - 0.015 - k * 0.045, w1 + 0.012 + rad * 0.6 - k * 0.006);
+      addBlob(c, 'foliage', leaf, tip, rad, new THREE.Vector3(0.9, 1.2, 0.8), 'sprig');
+      // Flowers along the sprig, a little cluster at its tip.
+      const p = tip.clone().add(new THREE.Vector3(rng.jitter(0.02), rng.jitter(0.01), rad * 0.7));
+      addBlob(c, 'flower', color, p, rng.range(0.015, 0.019), new THREE.Vector3(1, 0.9, 0.85), 'floret');
     }
+    const p = tip.clone().add(new THREE.Vector3(rng.jitter(0.012), -0.028, 0.012));
+    addBlob(c, 'flower', color, p, rng.range(0.017, 0.021), new THREE.Vector3(1, 0.9, 0.85), 'floret');
   }
 }
 
-/** A dome of florets around `centre` (one on top, the rest in a ring). */
-function umbel(c: Ctx, centre: THREE.Vector3, count: number, color: THREE.Color): void {
+/**
+ * A geranium umbel: a bumpy ball of florets, its bumps picked out in
+ * lighter and darker tones (a cheaper, coarser ball on large houses).
+ */
+function umbel(c: Ctx, centre: THREE.Vector3, color: THREE.Color): void {
   const { rng } = c;
-  const ring = count - 1;
-  const a0 = rng.range(0, Math.PI * 2);
-  addBlob(c, 'flower', vary(color, rng, 0.04, 0.03, 0.006), centre.clone().add(new THREE.Vector3(0, 0.022, 0.004)), rng.range(0.02, 0.023), new THREE.Vector3(1, 0.85, 1), 'floret');
-  for (let k = 0; k < ring; k++) {
-    const a = a0 + (k / ring) * Math.PI * 2 + rng.jitter(0.3);
-    const r = rng.range(0.028, 0.036);
-    const p = centre.clone().add(new THREE.Vector3(Math.cos(a) * r, rng.jitter(0.006), Math.sin(a) * r * 0.85));
-    addBlob(c, 'flower', vary(color, rng, 0.05, 0.04, 0.008), p, rng.range(0.016, 0.021), new THREE.Vector3(1, 0.85, 1), 'floret');
-  }
+  const r = rng.range(0.046, 0.056);
+  const kind: BlobKind = c.look.pompoms ? 'pompom' : 'ball';
+  addBlob(c, 'flower', vary(color, rng, 0.04, 0.03, 0.006), centre, r, new THREE.Vector3(1, 0.85, 0.9), kind, (p, _n, out) => {
+    // Per-floret tone: a hash of the (world) position, so neighbouring bumps differ.
+    const h = Math.sin(p.x * 431.7 + p.y * 917.3 + p.z * 253.9) * 43758.5453;
+    out.multiplyScalar(0.74 + 0.42 * (h - Math.floor(h)));
+  });
 }
 
 /** One strong colour per box (preferring the palette's saturated flowers), and an accent. */
@@ -1011,7 +1025,8 @@ function buildHood(c: Ctx, o: Opening): void {
     uc: (o.u0 + o.u1) / 2,
     bl: timberWall ? s.u0 - BRACKET_W / 2 - 0.002 : z.u0 + 0.045,
     br: timberWall ? s.u1 + BRACKET_W / 2 + 0.002 : z.u1 - 0.045,
-    maxProj: Math.max(0.3, Math.min(0.62, z.w1 - 0.12)),
+    // Under the eave of a single-storey house the zone's ceiling holds out to 0.6 m.
+    maxProj: Math.max(0.3, Math.min(c.layout.storeys.length > 1 ? 0.62 : 0.56, z.w1 - 0.12)),
   };
   const gabled = planGabled(site, rng);
   const lean = planLeanTo(site, rng);
@@ -1130,9 +1145,9 @@ function gabledHood(c: Ctx, site: HoodSite, g: GabledPlan): void {
   const cap = HOOD_CAP * 1.6;
   c.b.add(softBox(cap, cap, capLen, 0.02), 'roof', vary(pal.roof, rng, 0.05, 0.04, 0.01), at(wall, uc, apexTop + HOOD_CAP - cap * 0.707, 0.06 + capLen / 2, 0, 0, Math.PI / 4));
   // Ridge beam under the apex, let into the wall.
-  block(c, 'timber', timber, { u: [uc - 0.04, uc + 0.04], y: [ridgeY - 0.09, ridgeY + 0.01], w: [back, g.proj - 0.005] }, 0.012);
+  block(c, 'timber', timber, { u: [uc - 0.04, uc + 0.04], y: [ridgeY - 0.09, ridgeY + 0.01], w: [back, g.proj - 0.005] }, 0.012, 0, true);
   // A small pendant under the apex of the front.
-  block(c, 'timber', timber, { u: [uc - 0.022, uc + 0.022], y: [ridgeY - 0.17, ridgeY + 0.02], w: [g.proj - 0.005, g.proj + 0.04] }, 0.01);
+  block(c, 'timber', timber, { u: [uc - 0.022, uc + 0.022], y: [ridgeY - 0.17, ridgeY + 0.02], w: [g.proj - 0.005, g.proj + 0.04] }, 0.01, 0, true);
 
   let tieTop: number;
   let uA: number;
@@ -1153,7 +1168,7 @@ function gabledHood(c: Ctx, site: HoodSite, g: GabledPlan): void {
     for (const side of [-1, 1] as const) {
       const uo = uc + side * (g.e + 0.01); // outer face of the eave beam
       const ub = uo - side * (beamW / 2);
-      block(c, 'timber', timber, { u: [ub - beamW / 2, ub + beamW / 2], y: [g.yE - beamH + 0.012, g.yE + 0.012], w: [-0.02, g.proj - 0.01] }, 0.012);
+      block(c, 'timber', timber, { u: [ub - beamW / 2, ub + beamW / 2], y: [g.yE - beamH + 0.012, g.yE + 0.012], w: [-0.02, g.proj - 0.01] }, 0.012, 0, true);
       const ur = uo + side * 0.012;
       tieRod(c, new THREE.Vector3(ur, anchorY, 0), new THREE.Vector3(ur, g.yE - beamH * 0.5, g.proj - 0.06), iron);
     }
@@ -1165,7 +1180,7 @@ function gabledHood(c: Ctx, site: HoodSite, g: GabledPlan): void {
   if (g.front === 'boarded') {
     // Tie beam between the eaves and vertical boards closing the gable front.
     const tie: [number, number] = [tieTop - 0.075, tieTop];
-    block(c, 'timber', timber, { u: [uA, uB], y: tie, w: [g.proj - 0.07, g.proj - 0.005] }, 0.012);
+    block(c, 'timber', timber, { u: [uA, uB], y: tie, w: [g.proj - 0.07, g.proj - 0.005] }, 0.012, 0, true);
     const n = Math.max(4, Math.round((2 * g.e) / 0.1));
     const bw = (uB - uA) / n;
     for (let i = 0; i < n; i++) {
@@ -1586,13 +1601,21 @@ function at(wall: WallSpec, u: number, y: number, w: number, rx = 0, ry = 0, rz 
 }
 
 /** Soft box filling an axis-aligned wall-local extent, optionally turned by rz about its centre. */
-function block(c: Ctx, mat: MatKey, color: ColorLike, e: Extent, round = 0.012, rz = 0): void {
+/**
+ * Box filling an axis-aligned wall-local extent, optionally turned by rz
+ * about its centre. Pieces lying on the wall only show their front, so by
+ * default only the front edges are softened (`frontBox`, 20 triangles);
+ * `allRound` softens every edge (`softBox`, 44) for pieces seen from below
+ * or the side.
+ */
+function block(c: Ctx, mat: MatKey, color: ColorLike, e: Extent, round = 0.012, rz = 0, allRound = false): void {
   const [u0, u1] = e.u;
   const [y0, y1] = e.y;
   const [w0, w1] = e.w;
   if (u1 - u0 < 1e-3 || y1 - y0 < 1e-3 || w1 - w0 < 1e-3) return;
   const m = at(c.wall, (u0 + u1) / 2, (y0 + y1) / 2, (w0 + w1) / 2, 0, 0, rz);
-  c.b.add(softBox(u1 - u0, y1 - y0, w1 - w0, round), mat, color, m);
+  const g = allRound ? softBox(u1 - u0, y1 - y0, w1 - w0, round) : frontBox(u1 - u0, y1 - y0, w1 - w0, round);
+  c.b.add(g, mat, color, m);
 }
 
 /** Like `block`, tipped forward by `tilt` radians (sills shed water). */
@@ -1601,7 +1624,8 @@ function blockTilted(c: Ctx, mat: MatKey, color: ColorLike, e: Extent, round: nu
   const [y0, y1] = e.y;
   const [w0, w1] = e.w;
   const m = at(c.wall, (u0 + u1) / 2, (y0 + y1) / 2, (w0 + w1) / 2, tilt, 0, 0);
-  c.b.add(softBox(u1 - u0, y1 - y0, w1 - w0, round), mat, color, m);
+  const g = fine(c) < 0.55 ? frontBox(u1 - u0, y1 - y0, w1 - w0, round) : softBox(u1 - u0, y1 - y0, w1 - w0, round);
+  c.b.add(g, mat, color, m);
 }
 
 /** Extrude a wall-local (u, y) shape from w0 to w1 and add it to the wall's builder. */
@@ -1715,29 +1739,118 @@ function buildSoftBox(sx: number, sy: number, sz: number, round: number): THREE.
 }
 
 /**
- * Lumpy, smooth-shaded unit blobs, a few cached variants per kind:
- * 'clump' (foliage, 56 tris), 'sprig' (trailing foliage, 20) and 'floret'
- * (one bloom of an umbel, 8).
+ * Box centred on the origin whose four front (+z) edges are chamfered with
+ * normals blending from the sides to the front, so it shades like a soft
+ * edge where it is seen: 20 triangles.
  */
-type BlobKind = 'clump' | 'sprig' | 'floret';
+function frontBox(sx: number, sy: number, sz: number, round: number): THREE.BufferGeometry {
+  return cached(`fbox:${sx.toFixed(4)},${sy.toFixed(4)},${sz.toFixed(4)},${round.toFixed(4)}`, () => {
+    const hx = sx / 2;
+    const hy = sy / 2;
+    const hz = sz / 2;
+    const r = Math.min(round, hx * 0.9, hy * 0.9, sz * 0.9);
+    if (r <= 0.0015) return new THREE.BoxGeometry(sx, sy, sz);
+    const zs = hz - r;
+    const pos: number[] = [];
+    const nor: number[] = [];
+    type V = [number, number, number];
+    const tri = (a: V, b: V, d: V, na: V, nb: V, nd: V) => {
+      pos.push(...a, ...b, ...d);
+      nor.push(...na, ...nb, ...nd);
+    };
+    const F: V = [0, 0, 1];
+    const B: V = [0, 0, -1];
+    // Back and front faces.
+    tri([-hx, -hy, -hz], [-hx, hy, -hz], [hx, hy, -hz], B, B, B);
+    tri([-hx, -hy, -hz], [hx, hy, -hz], [hx, -hy, -hz], B, B, B);
+    const fx = hx - r;
+    const fy = hy - r;
+    tri([-fx, -fy, hz], [fx, -fy, hz], [fx, fy, hz], F, F, F);
+    tri([-fx, -fy, hz], [fx, fy, hz], [-fx, fy, hz], F, F, F);
+    // Sides and chamfers, counter-clockwise seen from outside: corners (x, y) in CCW order.
+    const corners: [number, number][] = [
+      [-1, -1],
+      [1, -1],
+      [1, 1],
+      [-1, 1],
+    ];
+    for (let i = 0; i < 4; i++) {
+      const [ax, ay] = corners[i];
+      const [bx, by] = corners[(i + 1) % 4];
+      const n: V = [ax === bx ? ax : 0, ay === by ? ay : 0, 0];
+      const a0: V = [ax * hx, ay * hy, -hz];
+      const b0: V = [bx * hx, by * hy, -hz];
+      const a1: V = [ax * hx, ay * hy, zs];
+      const b1: V = [bx * hx, by * hy, zs];
+      const a2: V = [ax * fx, ay * fy, hz];
+      const b2: V = [bx * fx, by * fy, hz];
+      tri(a0, b0, b1, n, n, n);
+      tri(a0, b1, a1, n, n, n);
+      tri(a1, b1, b2, n, n, F);
+      tri(a1, b2, a2, n, F, F);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+    return g;
+  });
+}
+
+/**
+ * Lumpy, smooth-shaded unit blobs, a few cached variants per kind:
+ * 'clump' (foliage, 36 tris), 'sprig' (trailing foliage, 20), 'floret' (a
+ * single bloom, 8), 'ball' and 'pompom' (bumpy flower balls, 20 / 80).
+ */
+type BlobKind = 'clump' | 'sprig' | 'floret' | 'ball' | 'pompom';
 const blobCache = new Map<BlobKind, THREE.BufferGeometry[]>();
 function blobVariants(kind: BlobKind): THREE.BufferGeometry[] {
   let list = blobCache.get(kind);
   if (!list) {
     list = [0, 1, 2, 3].map((seed) => {
       const base =
-        kind === 'clump' ? new THREE.SphereGeometry(1, 7, 5) : kind === 'floret' ? new THREE.OctahedronGeometry(1, 0) : new THREE.IcosahedronGeometry(1, 0);
+        kind === 'clump'
+          ? new THREE.SphereGeometry(1, 6, 4)
+          : kind === 'floret'
+            ? new THREE.OctahedronGeometry(1, 0)
+            : new THREE.IcosahedronGeometry(1, kind === 'pompom' ? 1 : 0);
       base.deleteAttribute('normal');
       base.deleteAttribute('uv');
       const g = mergeVertices(base);
-      return lumpify(g, kind === 'clump' ? 0.14 : kind === 'floret' ? 0.08 : 0.18, seed + 1);
+      if (kind === 'pompom') {
+        // Florets: push the twelve 5-fold vertices out into bumps, so the ball reads as a cluster.
+        const pos = g.attributes.position as THREE.BufferAttribute;
+        const v = new THREE.Vector3();
+        const phi = (1 + Math.sqrt(5)) / 2;
+        const tips = [
+          [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+          [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+          [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+        ].map(([x, y, z]) => new THREE.Vector3(x, y, z).normalize());
+        for (let i = 0; i < pos.count; i++) {
+          v.fromBufferAttribute(pos, i).normalize();
+          const tip = tips.some((t) => t.dot(v) > 0.99);
+          v.multiplyScalar(tip ? 1.16 : 0.96);
+          pos.setXYZ(i, v.x, v.y, v.z);
+        }
+      }
+      const lumps: Record<BlobKind, number> = { clump: 0.14, sprig: 0.18, floret: 0.12, ball: 0.2, pompom: 0.08 };
+      return lumpify(g, lumps[kind], seed + 1);
     });
     blobCache.set(kind, list);
   }
   return list;
 }
 
-function addBlob(c: Ctx, mat: MatKey, color: ColorLike, centre: THREE.Vector3, radius: number, scale: THREE.Vector3, kind: BlobKind): void {
+function addBlob(
+  c: Ctx,
+  mat: MatKey,
+  color: ColorLike,
+  centre: THREE.Vector3,
+  radius: number,
+  scale: THREE.Vector3,
+  kind: BlobKind,
+  paint?: (p: THREE.Vector3, n: THREE.Vector3, out: THREE.Color) => void,
+): void {
   const variants = blobVariants(kind);
   const g = variants[c.rng.int(0, variants.length - 1)];
   // Spin first (variety), then stretch along the wall axes, then place.
@@ -1746,7 +1859,7 @@ function addBlob(c: Ctx, mat: MatKey, color: ColorLike, centre: THREE.Vector3, r
     .makeTranslation(centre.x, centre.y, centre.z)
     .multiply(new THREE.Matrix4().makeScale(radius * scale.x, radius * scale.y, radius * scale.z))
     .multiply(spin);
-  c.b.add(g, mat, color, mul(c.wall.frame, m));
+  c.b.add(g, mat, color, mul(c.wall.frame, m), paint);
 }
 
 /**
@@ -1774,4 +1887,17 @@ function randomSplit(total: number, n: number, spread: number, rng: Rng): number
 
 function clamp(v: number, a: number, b: number): number {
   return Math.max(a, Math.min(b, v));
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+/**
+ * How much fine, repeated detail this house gets: 1 for an ordinary house,
+ * 0 for the largest ones (layout.detail 0.45), so big houses stay near the
+ * triangle budget.
+ */
+function fine(c: Ctx): number {
+  return clamp((c.layout.detail - 0.45) / 0.55, 0, 1);
 }

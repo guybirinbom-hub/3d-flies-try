@@ -154,6 +154,8 @@ interface Look {
   dressedStone: THREE.Color;
   flowerBox: boolean;
   finial: boolean;
+  /** Plaster gables: upright boards in the gable triangle. */
+  boardedGable: boolean;
   /** Tiles of the dormer roofs and tile-hung cheeks. */
   tile: TileSpec;
   hung: TileSpec;
@@ -187,6 +189,7 @@ function chooseLook(layout: HouseLayout, rng: Rng): Look {
     dressedStone: mix(pal.stone, '#efe8dc', 0.3),
     flowerBox: layout.params.flowerBoxes && rng.chance(0.6),
     finial: rng.chance(0.4),
+    boardedGable: rng.chance(0.6),
     tile,
     hung,
     main: mainCourses(layout),
@@ -246,7 +249,8 @@ interface Geo {
   fo: number;
   so: number;
   zFront: number;
-  /** Average top of the dormer's tiles above its roof underside (perpendicular). */
+  /** The dormer roof's tiles, and their average top above its roof underside (perpendicular). */
+  tile: TileSpec;
   cover: number;
   /** Window in face-local (u, y). */
   win: { u0: number; u1: number; y0: number; y1: number; arched: boolean };
@@ -282,7 +286,13 @@ function geoOf(layout: HouseLayout, d: DormerSpec, look: Look, rng: Rng): Geo {
   const xc = d.sign * d.x;
   const hw = d.width / 2;
   const [wx0, wx1] = d.sign > 0 ? [d.window.x0, d.window.x1] : [-d.window.x1, -d.window.x0];
-  const t = look.tile;
+  // A long dormer roof (wide dormer, gentle main roof) gets slightly larger
+  // tiles, so no dormer runs far past ~10k triangles.
+  const so = rng.range(0.12, 0.17);
+  const run = d.faceZ - d.backZ + 0.2;
+  const area = d.roof === 'gable' ? (2 * (hw + so) / Math.cos(d.pitch)) * run * 0.8 : 2 * (hw + so) * (run / Math.cos(d.pitch));
+  const est = area / (look.tile.width * look.tile.gauge);
+  const t = est > 150 ? scaledTiles(look.tile, Math.min(1.3, Math.sqrt(est / 150)), 1) : look.tile;
   const cover = DECK + 0.003 + t.thickness + 0.6 * tileRise(t);
   const style = d.style;
   const timber = style === 'timber';
@@ -305,11 +315,13 @@ function geoOf(layout: HouseLayout, d: DormerSpec, look: Look, rng: Rng): Geo {
     cD: Math.cos(d.pitch),
     sD: Math.sin(d.pitch),
     fo: rng.range(0.16, 0.24),
-    so: rng.range(0.12, 0.17),
+    so,
+    tile: t,
     zFront: 0,
     cover,
     win: { u0: wx0 - (xc - hw), u1: wx1 - (xc - hw), y0: d.window.y0, y1: d.window.y1, arched: d.window.arched },
-    faceProud: timber || style === 'stone' ? 0.05 : look.cheek === 'boards' ? 0.03 : 0.028,
+    // (Stone faces start their stones above the apron's upstand.)
+    faceProud: timber ? 0.05 : style === 'stone' ? 0.003 : 0.028,
     cheekProud: look.cheek === 'timber' ? 0.05 : look.cheek === 'tiles' ? 0.06 : look.cheek === 'boards' ? 0.035 : 0.004,
     cheekEnd: 0,
   };
@@ -442,19 +454,57 @@ function faceTimber(k: Kit, rng: Rng): void {
   }
 }
 
-/** Plaster face: corner boards and a timber lintel over the window. */
+/**
+ * Plaster face: corner boards, a timber lintel over a square-headed window
+ * or a moulded architrave round an arched one, and (sometimes) a boarded
+ * gable above a band at the eave line.
+ */
 function facePlaster(k: Kit, rng: Rng): void {
   const { g, look } = k;
   const F = faceFrame(g);
   const W = 2 * g.hw;
   const bw = 0.1;
-  const top = (u: number) => (g.gable ? Math.min(g.eaveY + 0.0, g.ridgeY - Math.abs(u - g.hw) * g.tD) : g.eaveY);
+  const trim = () => vary(look.trim, rng, 0.03, 0.02, 0.004);
   for (const [u0, u1] of [[0, bw], [W - bw, W]] as const) {
-    const poly: V2[] = [[u0, g.baseY - 0.04], [u1, g.baseY - 0.04], [u1, top(u1)], [u0, top(u0)]];
-    put(k, prism(poly, -0.01, 0.026, 0.008), 'wood', vary(look.trim, rng, 0.03, 0.02, 0.004), F);
+    put(k, prism(rect(u0, u1, g.baseY - 0.04, g.eaveY), -0.01, 0.026, 0.008), 'wood', trim(), F);
   }
   const w = g.win;
-  put(k, prism(rect(w.u0 - 0.1, w.u1 + 0.1, w.y1 - 0.012, w.y1 + 0.13), -0.02, 0.045, 0.016), 'timber', vary(look.pal.timber, rng, 0.04, 0.03, 0.005), F);
+  if (w.arched) {
+    // Architrave: two jamb boards and a ring of short segments round the arch.
+    const uc = (w.u0 + w.u1) / 2;
+    const r = (w.u1 - w.u0) / 2;
+    const spring = w.y1 - r;
+    const aw = 0.07;
+    const color = trim();
+    for (const [u0, u1] of [[w.u0 - aw, w.u0 + 0.004], [w.u1 - 0.004, w.u1 + aw]] as const) {
+      put(k, prism(rect(u0, u1, w.y0 - 0.02, spring + 0.004), -0.01, 0.024, 0.006), 'wood', color, F);
+    }
+    const n = 6;
+    for (let i = 0; i < n; i++) {
+      const a0 = (Math.PI * i) / n;
+      const a1 = (Math.PI * (i + 1)) / n;
+      const poly: V2[] = [a0, a1, a1, a0].map((a, j) => {
+        const rr = j < 2 ? r - 0.004 : r + aw;
+        return [uc + rr * Math.cos(a), spring + rr * Math.sin(a)] as V2;
+      });
+      put(k, prism(poly, -0.01, 0.024, 0.006), 'wood', color, F);
+    }
+  } else {
+    put(k, prism(rect(w.u0 - 0.1, w.u1 + 0.1, w.y1 - 0.012, w.y1 + 0.13), -0.02, 0.045, 0.016), 'timber', vary(look.pal.timber, rng, 0.04, 0.03, 0.005), F);
+  }
+  if (g.gable && look.boardedGable) {
+    // A band across the eave line, upright boards in the triangle above.
+    put(k, prism(rect(0, W, g.eaveY - 0.03, g.eaveY + 0.07), -0.01, 0.034, 0.01), 'wood', trim(), F);
+    const tri: V2[] = [[0, g.eaveY + 0.07], [W, g.eaveY + 0.07], [g.hw, g.ridgeY]];
+    const n = Math.max(3, Math.round(W / 0.12));
+    const bwid = W / n;
+    const boards = mix(look.pal.wood, look.pal.plaster, 0.15);
+    for (let i = 0; i < n; i++) {
+      const poly = clipConvex(rect(i * bwid + 0.004, (i + 1) * bwid - 0.004, g.eaveY, g.ridgeY + 1), tri);
+      if (poly.length < 3 || polyArea(poly) < 0.002) continue;
+      put(k, prism(poly, -0.01, 0.02 + rng.range(0, 0.004), 0.005), 'wood', vary(boards, rng, 0.04, 0.03, 0.006), F);
+    }
+  }
 }
 
 /**
@@ -880,10 +930,8 @@ function flowerBox(k: Kit, sillBottom: number, rng: Rng): void {
   // Keep clear of the apron (which follows the roof down from the face).
   if (bot < g.baseY + 0.02) return;
   const wood = vary(rng.chance(0.5) ? look.pal.wood : mix(look.pal.shutter, look.pal.wood, 0.25), rng, 0.04, 0.03, 0.006);
-  const box = (u: [number, number], y: [number, number], ww: [number, number], color: ColorLike, mat: MatKey = 'wood', r = 0.012) => {
-    const m = new THREE.Matrix4().makeTranslation(0, 0, 0);
-    put(k, prism(rect(u[0], u[1], y[0], y[1]), ww[0], ww[1], r), mat, color, mul(F, m));
-  };
+  const box = (u: [number, number], y: [number, number], ww: [number, number], color: ColorLike, mat: MatKey = 'wood', r = 0.012) =>
+    put(k, prism(rect(u[0], u[1], y[0], y[1]), ww[0], ww[1], r), mat, color, F);
   box([u0, u1], [bot, top - 0.03], [w0, w1], wood);
   box([u0 - 0.012, u1 + 0.012], [top - 0.045, top], [w0, w1 + 0.012], mix(wood, '#000000', 0.08));
   box([u0 + 0.03, u1 - 0.03], [top - 0.02, top + 0.004], [w0 + 0.03, w1 - 0.03], SOIL, 'wood', 0);
@@ -976,7 +1024,7 @@ function keepSide(poly: V2[], p: V2, q: V2, inside: V2, margin: number): V2[] {
 
 function buildGableRoof(k: Kit, rng: Rng): void {
   const { g, look } = k;
-  const t = look.tile;
+  const t = g.tile;
   const ae = g.hw + g.so;
   const zEave = ae / g.cD;
   const rise = tileRise(t);
@@ -1053,8 +1101,8 @@ function buildGableRoof(k: Kit, rng: Rng): void {
       const m = new THREE.Matrix4().makeTranslation(0, rng.jitter(0.003), 0);
       put(k, sweepZ(ridge, z0, z1, 0.05, [g.xc, g.ridgeY + DECK / g.cD]), 'roof', vary(ridgeColor, rng, 0.02, 0.02, 0.004), m);
     }
-    const zs = Math.max(0.04, zEnd - 0.2);
-    leadOnRoof(k, g.xc - 0.22, g.xc + 0.22, zs, zEnd + 0.16, 0.018, 0.003, k.lead, { x0: true, x1: true, za: true, zb: true });
+    const zs = Math.max(0.04, zEnd - 0.16);
+    leadOnRoof(k, g.xc - 0.17, g.xc + 0.17, zs, zEnd + 0.12, 0.018, 0.003, k.lead, { x0: true, x1: true, za: true, zb: true });
   }
 
   if (look.finial) {
@@ -1242,7 +1290,7 @@ function shedFrame(g: Geo): THREE.Matrix4 {
 
 function buildShedRoof(k: Kit, rng: Rng): void {
   const { g, look } = k;
-  const t = look.tile;
+  const t = g.tile;
   const S = shedFrame(g);
   const half = g.hw + g.so;
   // Where the shed roof's tiles meet the main roof's.
@@ -1255,7 +1303,8 @@ function buildShedRoof(k: Kit, rng: Rng): void {
   const tail0 = Zf + 0.045;
   const top = Zj - 0.06;
   const n = Math.max(2, Math.round((tail0 - top - t.length * 0.6) / t.gauge) + 1);
-  layTiles(k, S, rect(-half, half, top, tail0), t, DECK + 0.003, { tail0, gauge: (tail0 - top - t.length * 0.6) / (n - 1), minZ: top, tilt: Math.atan2(rise, t.length) }, rng);
+  const lastTail = top + t.length * 0.6;
+  layTiles(k, S, rect(-half, half, top, tail0), t, DECK + 0.003, { tail0, gauge: (tail0 - lastTail) / (n - 1), minZ: lastTail - 0.01, tilt: Math.atan2(rise, t.length) }, rng);
 
   // Lead flashing over the top course, tucked up under the main roof's tiles.
   const lead = k.lead;
