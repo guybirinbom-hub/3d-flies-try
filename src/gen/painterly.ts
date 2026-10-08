@@ -8,11 +8,23 @@ import type * as THREE from 'three';
  * It is a shader tweak only, so exported glTF files keep just the vertex
  * colours, which already carry per-piece variation.
  */
+
+/** The viewer's settings per material slot. */
+export const PAINTERLY: Partial<Record<string, PainterlyOptions>> = {
+  plaster: { amount: 0.08, scale: 0.6, damp: 0.12 },
+  mortar: { amount: 0.04, scale: 0.8, damp: 0.1 },
+  stone: { amount: 0.035, scale: 1.4, damp: 0.08 },
+  roof: { amount: 0.05, scale: 0.35 },
+  timber: { amount: 0.03, scale: 1.1 },
+  wood: { amount: 0.03, scale: 1.3 },
+};
 export interface PainterlyOptions {
   /** Strength of the mottling (0 = off). */
   amount: number;
   /** World-space frequency of the noise (higher = smaller blotches). */
   scale: number;
+  /** Darken surfaces near the ground (damp, splash), 0–1. */
+  damp?: number;
 }
 
 const NOISE_GLSL = /* glsl */ `
@@ -50,9 +62,10 @@ export function applyPainterly(material: THREE.Material, opts: PainterlyOptions)
       .replace(
         '#include <color_fragment>',
         `#include <color_fragment>
-        diffuseColor.rgb *= 1.0 + ${opts.amount.toFixed(3)} * (hwFbm(vHwWorld * ${opts.scale.toFixed(3)}) - 0.5) * 2.0;`,
+        diffuseColor.rgb *= 1.0 + ${opts.amount.toFixed(3)} * (hwFbm(vHwWorld * ${opts.scale.toFixed(3)}) - 0.5) * 2.0;
+        diffuseColor.rgb *= 1.0 - ${(opts.damp ?? 0).toFixed(3)} * (1.0 - smoothstep(0.05, 0.75, vHwWorld.y)) * (0.6 + 0.4 * hwNoise(vHwWorld * 3.0));`,
       );
   };
-  material.customProgramCacheKey = () => `painterly-${opts.amount}-${opts.scale}`;
+  material.customProgramCacheKey = () => `painterly-${opts.amount}-${opts.scale}-${opts.damp ?? 0}`;
   material.needsUpdate = true;
 }

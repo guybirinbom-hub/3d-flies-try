@@ -1,12 +1,15 @@
 import * as THREE from 'three';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import { createMaterials } from './gen/materials';
+import type { MatKey } from './gen/builder';
+import { applyPainterly, PAINTERLY } from './gen/painterly';
 import { generateHouse, type GeneratedHouse } from './gen/house';
 import { defaultParams, randomParams, type HouseParams } from './gen/params';
 import { loadParts } from './gen/parts';
 import { Rng } from './gen/rng';
 import { Stage } from './viewer/stage';
-import { cameraFor, CAMERA_PRESETS, type CameraPreset } from './viewer/cameras';
+import { cameraFor, CAMERA_PRESETS, fitDistance, type CameraPreset } from './viewer/cameras';
+import { placeAroundGreen, villageDressing } from './viewer/village';
 import { createPanel, type Panel, type ViewerState } from './viewer/panel';
 import './viewer/panel.css';
 
@@ -32,6 +35,7 @@ const container = document.getElementById('app')!;
 const stage = new Stage(container, { preserveDrawingBuffer: !live });
 stage.ao = q.get('ao') !== null ? q.get('ao') !== '0' : !live || container.clientWidth > 700;
 const materials = createMaterials();
+for (const [slot, opts] of Object.entries(PAINTERLY)) if (opts) applyPainterly(materials[slot as MatKey], opts);
 await loadParts();
 
 function paramsFromUrl(): HouseParams {
@@ -59,26 +63,57 @@ let houses: GeneratedHouse[] = [];
 const world = new THREE.Group();
 stage.scene.add(world);
 let panel: Panel | null = null;
+/** Layers hidden in the viewer (generated, just not shown). */
+const hidden = new Set<string>();
+let lastPreset: CameraPreset = 'iso';
+/** True after the user orbits/zooms: then rebuilds and animations leave the camera alone. */
+let userMoved = false;
+/** The camera eases along with the assembly animation until the user takes over. */
+let followExplode = false;
+let buildId = 0;
 
-function disposeHouses(): void {
-  for (const h of houses) {
-    h.group.traverse((o) => {
-      if (o instanceof THREE.Mesh) o.geometry.dispose();
-    });
-  }
+function disposeWorld(): void {
+  world.traverse((o) => {
+    if (o instanceof THREE.Mesh) o.geometry.dispose();
+  });
   world.clear();
   houses = [];
 }
 
-function rebuild(): void {
-  disposeHouses();
+const nextFrame = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+
+/** Regenerate from state. Villages are built one house per frame so the page stays responsive. */
+async function rebuild(): Promise<void> {
+  const id = ++buildId;
+  const before = houses.length === 1 ? houses[0].layout.bounds.max.clone() : null;
   if (state.gallery > 0) {
-    buildVillage(state.gallery);
+    const params = Array.from({ length: state.gallery }, (_, i) => randomParams(state.params.seed + i));
+    const built: GeneratedHouse[] = [];
+    for (const p of params) {
+      built.push(generateHouse(p, materials, { parts: state.parts }));
+      if (live) await nextFrame();
+      if (id !== buildId) return; // a newer rebuild started
+    }
+    disposeWorld();
+    const places = placeAroundGreen(
+      built.map((h) => h.layout),
+      new Rng(state.params.seed).fork('village'),
+    );
+    built.forEach((h, i) => {
+      h.group.position.set(places[i].x, 0, places[i].z);
+      h.group.rotation.y = places[i].rotY;
+      world.add(h.group);
+    });
+    houses = built;
+    world.add(villageDressing(built.map((h) => h.layout), places, materials, state.params.seed));
   } else {
     const h = generateHouse(state.params, materials, { parts: state.parts });
+    if (id !== buildId) return;
+    disposeWorld();
     world.add(h.group);
-    houses.push(h);
+    houses = [h];
   }
+  applyVisibility();
   applyExplode();
   const box = new THREE.Box3().setFromObject(world);
   stage.fitShadow(box.min, box.max);
@@ -87,25 +122,21 @@ function rebuild(): void {
     houses.reduce((s, h) => s + h.stats.ms, 0),
     houses.length,
   );
+  // Re-frame when the house grew or shrank a lot, unless the user is steering.
+  const after = houses.length === 1 ? houses[0].layout.bounds.max : null;
+  if (before && after && !userMoved && (Math.abs(after.y / before.y - 1) > 0.15 || Math.abs(after.x / before.x - 1) > 0.15)) {
+    setCamera(lastPreset);
+  }
 }
 
-/** Several random houses around a little green, each turned to face the middle. */
-function buildVillage(n: number): void {
-  const rng = new Rng(state.params.seed).fork('village');
-  const ring = Math.max(14, n * 2.6);
-  const centre = n > 6;
-  for (let i = 0; i < n; i++) {
-    const h = generateHouse(randomParams(state.params.seed + i), materials, { parts: state.parts });
-    const inMiddle = centre && i === 0;
-    const k = centre ? n - 1 : n;
-    const a = ((i - (centre ? 1 : 0)) / k) * Math.PI * 2 + rng.jitter(0.12);
-    const r = inMiddle ? 0 : ring * (0.85 + rng.next() * 0.3);
-    h.group.position.set(Math.sin(a) * r, 0, Math.cos(a) * r);
-    // A house's front faces +Z locally; turn each one to look at the green.
-    h.group.rotation.y = inMiddle ? 0.3 : a + Math.PI + rng.jitter(0.25);
-    world.add(h.group);
-    houses.push(h);
-  }
+function applyVisibility(): void {
+  for (const h of houses) for (const part of h.group.children) part.visible = !hidden.has(part.name);
+}
+
+function setLayerVisible(name: string, on: boolean): void {
+  if (on) hidden.delete(name);
+  else hidden.add(name);
+  applyVisibility();
 }
 
 function applyExplode(): void {
@@ -119,27 +150,42 @@ function applyExplode(): void {
   }
 }
 
-function setCamera(preset: CameraPreset): void {
+function setCamera(preset: CameraPreset, explode = 0): void {
+  lastPreset = preset;
+  userMoved = false;
   if (state.gallery > 0) {
-    const box = new THREE.Box3().setFromObject(world);
-    const size = box.getSize(new THREE.Vector3());
+    // Frame the houses (the trees around them may crop).
+    const box = new THREE.Box3();
+    for (const h of houses) box.expandByObject(h.group);
     const c = box.getCenter(new THREE.Vector3());
-    const d = Math.max(size.x, size.z) * 1.05;
-    stage.camera.position.copy(c).add(new THREE.Vector3(0.5, 0.62, 1).normalize().multiplyScalar(d));
-    stage.controls.target.copy(c).setY(1.5);
+    const dir = new THREE.Vector3(0.45, 0.62, 1).normalize();
+    const d = fitDistance(box, c, dir, stage.camera.fov, stage.camera.aspect, 1.0);
+    stage.camera.position.copy(c).addScaledVector(dir, d);
+    stage.controls.target.copy(c);
   } else {
-    const { position, target } = cameraFor(preset, houses[0].layout, stage.camera.fov, stage.camera.aspect);
+    const { position, target } = cameraFor(preset, houses[0].layout, stage.camera.fov, stage.camera.aspect, explode);
     stage.camera.position.copy(position);
     stage.controls.target.copy(target);
   }
   stage.controls.update();
+  // Haze scales with how far away we look from.
+  const dist = stage.camera.position.distanceTo(stage.controls.target);
+  stage.setFogRange(Math.max(60, dist * 1.8), Math.max(190, dist * 5.5));
 }
+
+stage.controls.addEventListener('start', () => {
+  userMoved = true;
+  followExplode = false;
+});
 
 /** `eye=x,y,z&at=x,y,z` in the URL overrides the preset (for reviewing any spot). */
 function cameraFromUrl(): boolean {
   const eye = q.get('eye')?.split(',').map(Number);
   const at = q.get('at')?.split(',').map(Number);
   if (eye?.length !== 3 || at?.length !== 3 || [...eye, ...at].some((v) => !Number.isFinite(v))) return false;
+  // Any angle, including looking up under the eaves.
+  stage.controls.minPolarAngle = 0;
+  stage.controls.maxPolarAngle = Math.PI;
   stage.camera.position.set(eye[0], eye[1], eye[2]);
   stage.controls.target.set(at[0], at[1], at[2]);
   stage.controls.update();
@@ -177,22 +223,33 @@ if (live) {
     rebuild,
     applyExplode,
     setCamera,
+    setLayerVisible,
+    isLayerVisible: (name) => !hidden.has(name),
+    onAssemblyStart: () => {
+      followExplode = state.gallery === 0;
+    },
     // Downloads are blocked inside the published artifact's sandbox.
     exportGLB: __ARTIFACT__ ? undefined : async () => download(await exportGLB(), `house-${state.params.seed}.glb`),
   });
 }
 
-rebuild();
+await rebuild();
 const camPreset = (CAMERA_PRESETS as readonly string[]).includes(q.get('cam') ?? '')
   ? (q.get('cam') as CameraPreset)
   : 'iso';
-if (!cameraFromUrl()) setCamera(camPreset);
+if (!cameraFromUrl()) setCamera(camPreset, state.explode);
 stage.observeResize(container);
 
 // Headless shots (ui=0) render on demand only: software WebGL is slow and a
 // continuous loop would just queue frames nobody looks at.
 function loop(): void {
   stage.controls.autoRotate = state.autoRotate;
+  if (followExplode && houses.length === 1) {
+    const { position, target } = cameraFor(lastPreset, houses[0].layout, stage.camera.fov, stage.camera.aspect, state.explode);
+    stage.camera.position.copy(position);
+    stage.controls.target.copy(target);
+    if (state.explode <= 0) followExplode = false;
+  }
   stage.render();
   requestAnimationFrame(loop);
 }

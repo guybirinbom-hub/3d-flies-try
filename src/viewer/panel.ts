@@ -1,3 +1,4 @@
+import { Color } from 'three';
 import { PALETTES, randomParams, type HouseParams, type WallStyle } from '../gen/params';
 import { PARTS } from '../gen/parts';
 import type { Stage } from './stage';
@@ -15,9 +16,14 @@ export interface PanelDeps {
   state: ViewerState;
   stage: Stage;
   /** Regenerate the house(s) from state. */
-  rebuild: () => void;
+  rebuild: () => Promise<void>;
   applyExplode: () => void;
   setCamera: (p: CameraPreset) => void;
+  /** Show/hide a generated layer without regenerating. */
+  setLayerVisible: (part: string, on: boolean) => void;
+  isLayerVisible: (part: string) => boolean;
+  /** Called when the assembly animation starts (the camera follows it). */
+  onAssemblyStart: () => void;
   /** Absent where downloads are impossible (the published artifact). */
   exportGLB?: () => Promise<void>;
 }
@@ -51,15 +57,17 @@ const STYLES: [WallStyle, string][] = [
 export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: HTMLElement, d: PanelDeps): Panel {
   const p = () => d.state.params;
   const updaters: (() => void)[] = [];
-  let queued = false;
+  // Regenerate shortly after the last change (dragging a slider would
+  // otherwise rebuild the whole house on every input event).
+  let timer = 0;
   const rebuildSoon = () => {
-    if (queued) return;
-    queued = true;
-    requestAnimationFrame(() => {
-      queued = false;
-      d.rebuild();
+    clearTimeout(timer);
+    setBusy(true);
+    timer = window.setTimeout(async () => {
+      await d.rebuild();
+      setBusy(false);
       refreshReadout();
-    });
+    }, 140);
   };
 
   // ----- header: the two things people do most ---------------------------
@@ -110,7 +118,9 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
       ),
       rangeParam('Storey height', 'storeyHeight', 2.4, 3.2, 0.05, 'm'),
       rangeParam('Plinth', 'plinthHeight', 0.15, 0.8, 0.05, 'm'),
-      rangeParam('Jetty (upper floor overhang)', 'jetty', 0, 0.45, 0.05, 'm'),
+      rangeParam('Jetty (upper floor overhang)', 'jetty', 0, 0.45, 0.05, 'm', undefined, () =>
+        p().floors > 1 && p().upperStyle !== 'stone' ? '' : p().floors > 1 ? 'Stone storeys don’t jetty out' : 'Needs two storeys',
+      ),
     ]),
     section('Walls', true, [
       segmentedField('Ground floor', STYLES, () => p().groundStyle, (v) => setParam('groundStyle', v)),
@@ -148,11 +158,13 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
     ]),
     section('View', false, [
       switchesRaw([
-        ['Village of nine', () => d.state.gallery > 0, (v) => {
+        ['Village of nine', () => d.state.gallery > 0, async (v) => {
           d.state.gallery = v ? 9 : 0;
-          d.rebuild();
-          d.setCamera('iso');
+          setBusy(true);
           refreshReadout();
+          await d.rebuild();
+          d.setCamera('iso');
+          setBusy(false);
         }],
         ['Turntable', () => d.state.autoRotate, (v) => (d.state.autoRotate = v)],
         ['Soft shadows (AO)', () => d.stage.ao, (v) => (d.stage.ao = v)],
@@ -166,6 +178,11 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
   const tris = el('span', '');
   const ms = el('span', '');
   foot.append(tris, ms);
+  let lastMs = '';
+  function setBusy(on: boolean) {
+    sheet.classList.toggle('busy', on);
+    ms.textContent = on ? 'building…' : lastMs;
+  }
 
   // Phone bottom sheet can fold away.
   const grab = button('Hide controls', 'grabber', () => {
@@ -207,8 +224,10 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
     step: number,
     unit: string,
     format?: (v: number) => string,
+    /** Returns a reason when the control has no effect right now ('' = active). */
+    inactive?: () => string,
   ) {
-    return rangeField(
+    const field = rangeField(
       label,
       min,
       max,
@@ -220,6 +239,18 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
       },
       format ?? ((v) => `${v.toFixed(step < 0.1 ? 2 : step < 1 ? 1 : 0)}${unit ? ` ${unit}`.replace(' °', '°') : ''}`),
     );
+    if (inactive) {
+      const note = hint('');
+      field.append(note);
+      const input = field.querySelector('input')!;
+      updaters.push(() => {
+        const why = inactive();
+        input.disabled = why !== '';
+        note.textContent = why;
+        note.hidden = why === '';
+      });
+    }
+    return field;
   }
 
   function rangeField(
@@ -306,15 +337,7 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
 
   function layerSwitches() {
     return switchesRaw(
-      PARTS.map((part) => [
-        part.label,
-        () => !d.state.parts || d.state.parts.includes(part.name),
-        (on: boolean) => {
-          const current = d.state.parts ?? PARTS.map((x) => x.name);
-          d.state.parts = on ? [...current, part.name] : current.filter((n) => n !== part.name);
-          d.rebuild();
-        },
-      ]),
+      PARTS.map((part) => [part.label, () => d.isLayerVisible(part.name), (on: boolean) => d.setLayerVisible(part.name, on)]),
     );
   }
 
@@ -344,7 +367,18 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
       return b;
     });
     grid.append(...swatches);
-    updaters.push(() => swatches.forEach((s) => s.setAttribute('aria-pressed', String(s.dataset.roof === p().palette.roof))));
+    // Random houses drift their colours a little, so highlight the nearest palette.
+    updaters.push(() => {
+      const roof = new Color(p().palette.roof);
+      let best: HTMLButtonElement | null = null;
+      let bestD = 0.02;
+      for (const sw of swatches) {
+        const c = new Color(sw.dataset.roof);
+        const dist = (c.r - roof.r) ** 2 + (c.g - roof.g) ** 2 + (c.b - roof.b) ** 2;
+        if (dist < bestD) [best, bestD] = [sw, dist];
+      }
+      swatches.forEach((sw) => sw.setAttribute('aria-pressed', String(sw === best)));
+    });
     wrap.append(lab, grid);
     return wrap;
   }
@@ -367,6 +401,7 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
   let anim = 0;
   function playAssembly() {
     cancelAnimationFrame(anim);
+    d.onAssemblyStart();
     if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
       d.state.explode = 0;
       d.applyExplode();
@@ -393,7 +428,8 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
     playAssembly,
     setStats(triangles, msTotal, houses) {
       tris.textContent = `${Math.round(triangles / 1000)}k triangles${houses > 1 ? ` · ${houses} houses` : ''}`;
-      ms.textContent = `built in ${msTotal} ms`;
+      lastMs = `built in ${msTotal} ms`;
+      if (!sheet.classList.contains('busy')) ms.textContent = lastMs;
     },
   };
 }

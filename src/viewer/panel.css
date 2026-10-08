@@ -420,3 +420,11 @@ input[type='range'] {
 .bare .views {
   display: none;
 }
+
+input[type='range']:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.sheet.busy .sheet-foot span:last-child {
+  color: var(--moss);
+}

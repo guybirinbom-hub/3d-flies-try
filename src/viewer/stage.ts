@@ -41,9 +41,11 @@ export class Stage {
     this.controls.minDistance = 2;
     this.controls.maxDistance = 120;
 
-    // Sky gradient background + matching fog.
-    this.scene.background = skyTexture();
-    this.scene.fog = new THREE.Fog('#dfe9ec', 60, 180);
+    // World-space sky dome whose horizon is exactly the fog colour, so the
+    // far meadow melts into the haze instead of meeting a hard seam.
+    this.scene.background = new THREE.Color(HAZE);
+    this.scene.fog = new THREE.Fog(HAZE, 60, 190);
+    this.scene.add(makeSky());
 
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -106,6 +108,13 @@ export class Stage {
     this.sun.shadow.needsUpdate = true;
   }
 
+  /** Scale the haze with the size of what is being looked at. */
+  setFogRange(near: number, far: number): void {
+    const fog = this.scene.fog as THREE.Fog;
+    fog.near = near;
+    fog.far = far;
+  }
+
   render(): void {
     this.controls.update();
     if (this.ao) this.composer.render();
@@ -113,43 +122,114 @@ export class Stage {
   }
 }
 
-function skyTexture(): THREE.Texture {
-  const c = document.createElement('canvas');
-  c.width = 4;
-  c.height = 256;
-  const g = c.getContext('2d')!;
-  const grad = g.createLinearGradient(0, 0, 0, 256);
-  grad.addColorStop(0, '#9cc3e6');
-  grad.addColorStop(0.55, '#cfe2ee');
-  grad.addColorStop(1, '#eef1e6');
-  g.fillStyle = grad;
-  g.fillRect(0, 0, 4, 256);
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
+/** Pale warm haze at the horizon (fog and the bottom of the sky). */
+const HAZE = '#e2e8dc';
+
+function makeSky(): THREE.Mesh {
+  const geom = new THREE.SphereGeometry(450, 32, 16);
+  const mat = new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false,
+    uniforms: {
+      zenith: { value: new THREE.Color('#86b3de') },
+      mid: { value: new THREE.Color('#bcd5e6') },
+      horizon: { value: new THREE.Color(HAZE) },
+    },
+    vertexShader: /* glsl */ `
+      varying vec3 vDir;
+      void main() {
+        vDir = normalize(position);
+        vec4 p = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        gl_Position = p.xyww; // always at the far plane
+      }`,
+    fragmentShader: /* glsl */ `
+      uniform vec3 zenith;
+      uniform vec3 mid;
+      uniform vec3 horizon;
+      varying vec3 vDir;
+      void main() {
+        float h = max(vDir.y, 0.0);
+        vec3 c = mix(horizon, mid, smoothstep(0.0, 0.18, h));
+        c = mix(c, zenith, smoothstep(0.15, 0.75, h));
+        gl_FragColor = vec4(c, 1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`,
+  });
+  const sky = new THREE.Mesh(geom, mat);
+  sky.name = 'sky';
+  sky.frustumCulled = false;
+  sky.renderOrder = -1;
+  sky.onBeforeRender = (_r, _s, camera) => sky.position.copy(camera.position);
+  return sky;
 }
 
-/** Gently undulating grass disc, flat near the house. */
+/** Smooth 2D value noise in [0, 1]. */
+function valueNoise(x: number, z: number): number {
+  const xi = Math.floor(x);
+  const zi = Math.floor(z);
+  const fx = x - xi;
+  const fz = z - zi;
+  const h = (a: number, b: number) => {
+    const s = Math.sin(a * 127.1 + b * 311.7) * 43758.5453;
+    return s - Math.floor(s);
+  };
+  const ux = fx * fx * (3 - 2 * fx);
+  const uz = fz * fz * (3 - 2 * fz);
+  const a = h(xi, zi) + (h(xi + 1, zi) - h(xi, zi)) * ux;
+  const b = h(xi, zi + 1) + (h(xi + 1, zi + 1) - h(xi, zi + 1)) * ux;
+  return a + (b - a) * uz;
+}
+
+function fbm(x: number, z: number): number {
+  return 0.55 * valueNoise(x, z) + 0.3 * valueNoise(x * 2.1 + 17, z * 2.1 - 9) + 0.15 * valueNoise(x * 4.3 - 5, z * 4.3 + 21);
+}
+
+/**
+ * Meadow: a polar grid (dense near the middle) so colour and height can vary
+ * everywhere. Flat around the houses, rolling gently into the distance.
+ */
 function makeGround(): THREE.Mesh {
-  const geom = new THREE.CircleGeometry(160, 160, 0, Math.PI * 2);
-  geom.rotateX(-Math.PI / 2);
-  const pos = geom.attributes.position as THREE.BufferAttribute;
-  const colors = new Float32Array(pos.count * 3);
-  const base = new THREE.Color('#8fae5d');
-  const dry = new THREE.Color('#b5b971');
-  const lush = new THREE.Color('#6f9a4f');
+  const rings = 96;
+  const segs = 144;
+  const radius = 220;
+  const positions: number[] = [];
+  const colors: number[] = [];
+  const index: number[] = [];
+  const base = new THREE.Color('#7f9c52');
+  const lush = new THREE.Color('#68893f');
+  const dry = new THREE.Color('#a2a763');
+  const clover = new THREE.Color('#5c7d3c');
   const c = new THREE.Color();
-  for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i);
-    const z = pos.getZ(i);
-    const d = Math.hypot(x, z);
-    const n = Math.sin(x * 0.21) * Math.cos(z * 0.17) + Math.sin(x * 0.53 + z * 0.41) * 0.5;
-    const lift = Math.max(0, d - 18) / 40;
-    pos.setY(i, n * 0.35 * Math.min(1, lift) - 0.002);
-    c.copy(base).lerp(n > 0 ? dry : lush, Math.min(1, Math.abs(n) * 0.45));
-    colors.set([c.r, c.g, c.b], i * 3);
+  for (let i = 0; i <= rings; i++) {
+    const r = radius * Math.pow(i / rings, 2.2);
+    for (let j = 0; j < segs; j++) {
+      const a = (j / segs) * Math.PI * 2;
+      const x = Math.cos(a) * r;
+      const z = Math.sin(a) * r;
+      const hills = (fbm(x * 0.012, z * 0.012) - 0.45) * 9 + (fbm(x * 0.04, z * 0.04) - 0.5) * 1.2;
+      const lift = THREE.MathUtils.smoothstep(r, 22, 70);
+      positions.push(x, hills * lift - 0.002, z);
+      // Broad blotches of lush and dry grass, small clover patches.
+      const broad = fbm(x * 0.07 + 3, z * 0.07 - 7);
+      const fine = fbm(x * 0.35, z * 0.35);
+      c.copy(base).lerp(broad > 0.5 ? dry : lush, Math.min(1, Math.abs(broad - 0.5) * 1.6));
+      if (fine > 0.68) c.lerp(clover, Math.min(1, (fine - 0.68) * 4));
+      colors.push(c.r, c.g, c.b);
+      if (i > 0) {
+        const cur = i * segs + j;
+        const nxt = i * segs + ((j + 1) % segs);
+        const prev = (i - 1) * segs + j;
+        const prevN = (i - 1) * segs + ((j + 1) % segs);
+        index.push(prev, nxt, cur, prev, prevN, nxt);
+      }
+    }
   }
-  geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geom.setIndex(index);
   geom.computeVertexNormals();
   const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1 }));
   mesh.name = 'ground';

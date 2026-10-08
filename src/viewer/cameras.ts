@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { HouseLayout } from '../gen/layout';
 import { wallPoint } from '../gen/layout';
+import { OUTWARD, roofLift } from '../gen/explode';
 
 export const CAMERA_PRESETS = [
   'iso',
@@ -21,23 +22,72 @@ export const CAMERA_PRESETS = [
 ] as const;
 export type CameraPreset = (typeof CAMERA_PRESETS)[number];
 
+/**
+ * Distance along `dir` (unit, from target to camera) at which every corner
+ * of `box` projects inside `fill` of the frame (NDC), found by bisection.
+ */
+export function fitDistance(
+  box: THREE.Box3,
+  target: THREE.Vector3,
+  dir: THREE.Vector3,
+  fovDeg: number,
+  aspect: number,
+  fill = 0.86,
+): number {
+  const cam = new THREE.PerspectiveCamera(fovDeg, aspect, 0.05, 2000);
+  const corners: THREE.Vector3[] = [];
+  for (const x of [box.min.x, box.max.x])
+    for (const y of [box.min.y, box.max.y]) for (const z of [box.min.z, box.max.z]) corners.push(new THREE.Vector3(x, y, z));
+  const fits = (d: number) => {
+    cam.position.copy(target).addScaledVector(dir, d);
+    cam.lookAt(target);
+    cam.updateMatrixWorld();
+    const v = new THREE.Vector3();
+    return corners.every((c) => {
+      v.copy(c).project(cam);
+      return v.z < 1 && Math.abs(v.x) <= fill && Math.abs(v.y) <= fill;
+    });
+  };
+  let lo = 0.5;
+  let hi = 600;
+  for (let i = 0; i < 40; i++) {
+    const mid = (lo + hi) / 2;
+    if (fits(mid)) hi = mid;
+    else lo = mid;
+  }
+  return hi;
+}
+
+/**
+ * Box to frame for a house, grown for the exploded view (layers move out
+ * and the roof and chimney lift).
+ */
+export function framingBox(layout: HouseLayout, explode = 0): THREE.Box3 {
+  const box = new THREE.Box3(layout.bounds.min.clone(), layout.bounds.max.clone());
+  if (explode > 0) {
+    box.max.y += explode * (roofLift(layout) + 1.6);
+    box.expandByVector(new THREE.Vector3(OUTWARD.openings, 0, OUTWARD.openings).multiplyScalar(explode));
+  }
+  return box;
+}
+
 /** Position + target for a named viewpoint around a house. */
 export function cameraFor(
   preset: CameraPreset,
   layout: HouseLayout,
   fovDeg: number,
   aspect: number,
+  explode = 0,
 ): { position: THREE.Vector3; target: THREE.Vector3 } {
-  const { min, max } = layout.bounds;
-  const size = max.clone().sub(min);
-  const target = new THREE.Vector3(0, max.y * 0.42, 0);
-  const radius = Math.max(size.x, size.y, size.z) * 0.62;
-  const fov = (fovDeg * Math.PI) / 180;
-  const fitFov = aspect < 1 ? 2 * Math.atan(Math.tan(fov / 2) * aspect) : fov;
-  const dist = (radius / Math.sin(fitFov / 2)) * 1.0;
+  const { max } = layout.bounds;
+  const box = framingBox(layout, explode);
+  const centre = box.getCenter(new THREE.Vector3());
+  const target = new THREE.Vector3(centre.x, box.min.y + (box.max.y - box.min.y) * 0.45, centre.z);
 
-  const from = (dx: number, dy: number, dz: number, d = dist) =>
-    target.clone().add(new THREE.Vector3(dx, dy, dz).normalize().multiplyScalar(d));
+  const from = (dx: number, dy: number, dz: number, fill = 0.95) => {
+    const dir = new THREE.Vector3(dx, dy, dz).normalize();
+    return target.clone().addScaledVector(dir, fitDistance(box, target, dir, fovDeg, aspect, fill));
+  };
 
   switch (preset) {
     case 'iso':
@@ -54,8 +104,11 @@ export function cameraFor(
       return { position: from(1, 0.25, 0.12), target };
     case 'top':
       return { position: from(0.02, 1, 0.35), target };
-    case 'low':
-      return { position: from(0.7, 0.08, 1.0, dist * 0.8), target: target.clone().setY(max.y * 0.5) };
+    case 'low': {
+      const t = target.clone().setY(max.y * 0.4);
+      const dir = new THREE.Vector3(0.7, 0.1, 1).normalize();
+      return { position: t.clone().addScaledVector(dir, fitDistance(box, t, dir, fovDeg, aspect, 0.92)), target: t };
+    }
     case 'door': {
       const d = layout.door;
       const wall = layout.walls.find((w) => w.id === d.wallId)!;
