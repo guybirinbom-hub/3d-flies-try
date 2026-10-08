@@ -152,12 +152,30 @@ export interface ChimneySpec {
   y1: number;
 }
 
+/**
+ * Steps in front of the door, in the door wall's local coordinates. The
+ * foundation part builds them; props keep out of this zone (and the path
+ * starts at its outer edge).
+ */
+export interface StoopSpec {
+  wallId: string;
+  u0: number;
+  u1: number;
+  /** Outward extent: steps occupy w ∈ [0, w1]. */
+  w1: number;
+  /** Number of steps from the ground up to the door threshold (floorY). */
+  steps: number;
+  /** Height of the door threshold (= ground storey floorY). */
+  topY: number;
+}
+
 export interface HouseLayout {
   params: HouseParams;
   storeys: StoreySpec[];
   walls: WallSpec[];
   openings: Opening[];
   door: Opening;
+  stoop: StoopSpec;
   roof: RoofSpec;
   chimney: ChimneySpec | null;
   /** World-space bounds of the whole house including roof overhang and chimney. */
@@ -438,7 +456,18 @@ export function computeLayout(p: HouseParams): HouseLayout {
   };
 
   if (!door) throw new Error('layout: house has no door');
-  return { params: p, storeys, walls, openings: allOpenings, door, roof, chimney, bounds };
+  const d: Opening = door;
+  const steps = Math.max(1, Math.ceil(p.plinthHeight / 0.19));
+  const stoopHalf = (d.u1 - d.u0) / 2 + 0.3 + (steps - 1) * 0.08;
+  const stoop: StoopSpec = {
+    wallId: d.wallId,
+    u0: (d.u0 + d.u1) / 2 - stoopHalf,
+    u1: (d.u0 + d.u1) / 2 + stoopHalf,
+    w1: 0.12 + steps * 0.32,
+    steps,
+    topY: storeys[0].floorY,
+  };
+  return { params: p, storeys, walls, openings: allOpenings, door: d, stoop, roof, chimney, bounds };
 }
 
 /** Evenly spaced centres along a wall, keeping `margin` clear at both ends. */

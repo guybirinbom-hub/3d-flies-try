@@ -30,14 +30,14 @@ HouseParams ──computeLayout──▶ HouseLayout ──parts──▶ PartBu
 
 | Part | Owns |
 |---|---|
-| `foundation` | The plinth band on the ground storey's outer faces, `y ∈ [0, plinthHeight]` for every wall style; door steps from the ground up to the door threshold. |
+| `foundation` | The plinth band on the ground storey's outer faces, `y ∈ [0, plinthHeight]` for every wall style; door steps from the ground up to the door threshold, inside `layout.stoop`. |
 | `walls` | The solid wall bodies (plaster, or mortar colour on stone storeys) with holes for openings, incl. gable triangles. |
 | `stonework` | Individual stones on the outer face of every `style === 'stone'` wall from `floorY` (ground storey) or `y0` up to `y1` / the gable slope; corner quoins. Never inside an opening `surround`. |
 | `timber` | Half-timber framing on every `style === 'timber'` wall (sill beam, top plate, corner posts, studs, braces, gable framing), plus floor bands / joist ends between storeys, especially under jetties. Never inside an opening `surround`. |
 | `openings` | Everything inside each opening's `surround`: frames, glazing bars, glass, door leaf & ironwork, lintel (wood or stone, arched heads), sill; plus shutters, flower boxes and a door canopy, which may extend outside the surround because they sit in front of everything else. |
 | `roof` | Deck (incl. soffit underside), tile courses, ridge cap, barge boards, fascia. Leaves a hole around the chimney footprint. |
 | `chimney` | The stack from `chimney.y0` to `chimney.y1`, cap, pots, and flashing where it meets the roof. |
-| `props` | Small things around the house: path, lantern by the door, bench/barrel/woodpile, potted plants, shrubs and flowers along the base. Never blocks the door or steps. |
+| `props` | Small things around the house: path (starting at the outer edge of `layout.stoop`), lantern by the door, bench/barrel/woodpile, potted plants, shrubs and flowers along the base. Never inside `layout.stoop`, never blocks the door. |
 
 ### Depth (w) budget — what sits in front of what
 
