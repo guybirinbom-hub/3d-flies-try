@@ -59,14 +59,20 @@ const TUFT_REACH = 0.17;
 /** Lanterns are modelled at a real-world size, then scaled up a little for the chunky style. */
 const LANTERN_SCALE = 1.3;
 const LANTERN_HEIGHT = 0.37 * LANTERN_SCALE;
+/** Half the width a wall lantern (with its bracket) takes on the wall face. */
+const LANTERN_HALF = 0.17;
 
 const IRON = '#3d3834';
 const GLOW = '#ffe0a3';
-const DIRT = '#a8906c';
-const GRAVEL = '#a99c86';
-const GRASS_EDGE = '#93ab5f';
-const GRASS_ROOT = '#587b39';
-const GRASS_TIP = '#a9c56d';
+const DIRT = '#97815f';
+/** Gravel and earth showing in the joints between flagstones. */
+const GRAVEL = '#857a68';
+/** Lawn colour the path edges and the grass tufts melt into (the viewer's ground is ≈ #7f9c52–#8fb05a). */
+const LAWN = '#88a656';
+const GRASS_ROOT = '#6f8f47';
+const GRASS_TIP = '#9dbb5d';
+/** Path stones: the palette's stone, greyed and a little darker so the path does not glare. */
+const PATH_GREY = '#8c897f';
 const LEAVES = ['#55843d', '#659247', '#4d7a3a', '#76a04d', '#5f8a4a'];
 const TERRACOTTA = '#c4704a';
 const SOIL = '#5b4434';
@@ -158,7 +164,28 @@ class Site {
     );
     const { stoop } = layout;
     this.claim(this.wallFootprint(front, stoop.u0, stoop.u1, 0, stoop.w1), 'stoop');
-    for (const wall of this.walls) this.zones.set(wall, wall.openings.map(openingZone));
+    for (const wall of this.walls) this.zones.set(wall, wall.openings.map((o) => openingZone(o, layout)));
+    // Windows of the storeys above count too (in the ground wall's u): tall
+    // things against the wall (a lean-to, a climber) must stay below their
+    // sills and flower boxes. Jettied upper walls stand further out, but they
+    // run parallel, so projecting onto the ground wall's axis is enough.
+    for (const s of layout.storeys.slice(1)) {
+      for (const upper of s.walls) {
+        const ground = this.walls.find((w) => w.side === upper.side);
+        if (!ground) continue;
+        for (const o of upper.openings) {
+          const z = openingZone(o, layout);
+          const a = this.alongWall(ground, wallPoint(upper, z.u0, 0, 0));
+          const c = this.alongWall(ground, wallPoint(upper, z.u1, 0, 0));
+          this.zones.get(ground)?.push({ u0: Math.min(a, c), u1: Math.max(a, c), yLow: z.yLow });
+        }
+      }
+    }
+  }
+
+  /** u of a world point projected onto a wall's axis. */
+  alongWall(wall: WallSpec, p: { x: number; z: number }): number {
+    return (p.x - wall.start.x) * wall.dir.x + (p.z - wall.start.z) * wall.dir.z;
   }
 
   addZone(wall: WallSpec, zone: WallZone): void {
@@ -309,10 +336,11 @@ class Site {
 }
 
 /** The part of a wall face around an opening that props must keep below. */
-function openingZone(o: Opening): WallZone {
+function openingZone(o: Opening, layout: HouseLayout): WallZone {
   if (o.kind === 'door') {
-    // Nothing stands in front of the doorway or under its canopy.
-    return { u0: o.lintel.u0 - 0.15, u1: o.lintel.u1 + 0.15, yLow: -Infinity };
+    // Nothing stands in front of the doorway or under its hood.
+    const hood = layout.doorHood;
+    return { u0: Math.min(o.surround.u0, hood.u0) - 0.04, u1: Math.max(o.surround.u1, hood.u1) + 0.04, yLow: -Infinity };
   }
   // Open shutters reach about half the window width beyond each side.
   const shutter = o.shutters ? (o.u1 - o.u0) / 2 + 0.06 : 0;
@@ -617,7 +645,9 @@ function buildPath(site: Site, rng: Rng): PartBuilder {
   site.path = frames;
   for (let i = 0; i < frames.length - 1; i++) site.claim(segmentFootprint(frames[i], frames[i + 1], 0.05), 'path');
 
-  const stone = site.palette.stone;
+  // Field stones are greyer and a touch darker than the dressed stone of the
+  // house, so the path sits in the lawn instead of glaring pale pink-beige.
+  const stone = `#${mix(site.palette.stone, PATH_GREY, 0.4).multiplyScalar(0.93).getHexString()}`;
   if (style === 'stepping') {
     addSteppingStones(b, rng, frames, { first: 0.3, spacing: [0.55, 0.65], size: [0.22, 0.28], lateral: 0.06, stone });
   } else if (style === 'trail') {
@@ -625,7 +655,8 @@ function buildPath(site: Site, rng: Rng): PartBuilder {
     addSteppingStones(b, rng, frames, { first: 0.3, spacing: [0.65, 0.95], size: [0.18, 0.24], lateral: 0.12, stone });
     addPebbles(b, rng, frames, stone);
   } else {
-    addPathRibbon(b, rng, frames, mix(GRAVEL, stone, 0.3));
+    // Dark gravel joints between the flags.
+    addPathRibbon(b, rng, frames, mix(GRAVEL, DIRT, 0.25));
     addFlagstones(b, rng, frames, stone);
   }
   addPathGrass(b, rng, site, frames);
@@ -656,14 +687,14 @@ function pathFrames(site: Site, length: number, bend: number, halfWidth: number,
     const p = curve.getPointAt(s);
     const t = curve.getTangentAt(s);
     const flare = 1 + 0.28 * (1 - smoothstep(0, 0.18, s)); // wider where it meets the steps
-    const taper = 1 - 0.45 * smoothstep(0.72, 1, s); // and fading out at the far end
+    const spread = 1 + 0.3 * smoothstep(0.68, 1, s); // and spreading out as it fades into the lawn
     const wobble = 1 + 0.06 * Math.sin(s * 9 + phase);
     frames.push({
       x: origin.x + wall.dir.x * p.x + wall.normal.x * p.y,
       z: origin.z + wall.dir.z * p.x + wall.normal.z * p.y,
       tx: wall.dir.x * t.x + wall.normal.x * t.y,
       tz: wall.dir.z * t.x + wall.normal.z * t.y,
-      hw: halfWidth * flare * taper * wobble,
+      hw: halfWidth * flare * spread * wobble,
       s: s * arc,
     });
   }
@@ -715,20 +746,22 @@ function segmentFootprint(a: PathFrame, b: PathFrame, pad: number): Footprint {
 function addPathRibbon(b: PartBuilder, rng: Rng, frames: PathFrame[], base: THREE.Color): void {
   const soup = new TriSoup();
   const lanes = [-1, -0.55, 0, 0.55, 1];
-  const grass = new THREE.Color(GRASS_EDGE);
+  // The viewer darkens ground-level mortar a little ("damp"), so the edges
+  // aim slightly lighter than the lawn to melt into it.
+  const grass = new THREE.Color(LAWN).multiplyScalar(1.06);
   const phL = rng.range(0, 10);
   const phR = rng.range(0, 10);
   const rows: Vertex[][] = frames.map((f, i) => {
     const edgeL = 1 + 0.09 * Math.sin(i * 0.8 + phL) + rng.jitter(0.05);
     const edgeR = 1 + 0.09 * Math.sin(i * 0.7 + phR) + rng.jitter(0.05);
-    const fade = smoothstep(0.78, 1, i / (frames.length - 1));
+    const fade = smoothstep(0.62, 1, i / (frames.length - 1));
     return lanes.map((k) => {
       const edge = Math.abs(k) === 1;
       const lat = k * f.hw * (edge ? (k > 0 ? edgeL : edgeR) : 1);
       const p = beside(f, lat);
       const c = vary(base, rng, 0.035, 0.03, 0.005);
       if (k === 0) c.multiplyScalar(0.95); // the worn centre track
-      c.lerp(grass, Math.min(1, (edge ? 0.85 : Math.abs(k) > 0 ? 0.12 : 0) + fade * 0.9));
+      c.lerp(grass, Math.min(1, (edge ? 0.85 : Math.abs(k) > 0 ? 0.12 : 0) + fade * (0.75 + 0.25 * fade)));
       return { p: new THREE.Vector3(p.x, edge ? 0.004 : 0.008, p.z), c };
     });
   });
@@ -774,24 +807,26 @@ function addSteppingStones(b: PartBuilder, rng: Rng, frames: PathFrame[], o: Ste
 /** Rows of irregular flagstones (1–3 per row) laid edge to edge across the path. */
 function addFlagstones(b: PartBuilder, rng: Rng, frames: PathFrame[], stone: string): void {
   const total = frames[frames.length - 1].s;
-  const gap = 0.022;
+  const gap = 0.03; // half the joint: wide enough for the dark gravel to read
   let d = 0.07; // first row a hand's width off the bottom step
   while (d < total - 0.2) {
     const depth = rng.range(0.3, 0.42);
     const f = frameAt(frames, d + depth / 2);
     const hw = f.hw * 0.9;
-    const fadeOut = smoothstep(0.65, 1, d / total);
+    // Towards the far end the flags thin out, shrink and drift apart into the grass.
+    const fadeOut = smoothstep(0.6, 1, d / total);
     const cells = hw * 2 > 0.95 ? rng.int(2, 3) : hw * 2 > 0.55 ? rng.int(1, 2) : 1;
     // Random cut positions across the path.
     const cuts = [-hw];
     for (let k = 1; k < cells; k++) cuts.push(-hw + ((2 * hw) / cells) * (k + rng.jitter(0.25)));
     cuts.push(hw);
     for (let k = 0; k < cells; k++) {
-      if (rng.chance(fadeOut * 0.55)) continue;
-      const cw = (cuts[k + 1] - cuts[k]) / 2 - gap;
-      const cd = depth / 2 - gap;
+      if (rng.chance(fadeOut * 0.7)) continue;
+      const shrink = 1 - fadeOut * rng.range(0.15, 0.35);
+      const cw = ((cuts[k + 1] - cuts[k]) / 2 - gap) * shrink;
+      const cd = (depth / 2 - gap) * shrink;
       if (cw < 0.08) continue;
-      const lat = (cuts[k] + cuts[k + 1]) / 2 + rng.jitter(0.015);
+      const lat = (cuts[k] + cuts[k + 1]) / 2 + rng.jitter(0.015 + fadeOut * 0.05);
       const p = beside(f, lat);
       const m = mul(planMatrix(p.x, p.z, f.tx, f.tz), mat4(0, 0, rng.jitter(0.02), 0, rng.jitter(0.06), 0));
       b.add(slabGeometry(cellOutline(rng, cw, cd), rng.range(0.022, 0.034), 0.026), 'stone', stoneColor(rng, stone), m);
@@ -867,20 +902,25 @@ function addPathGrass(b: PartBuilder, rng: Rng, site: Site, frames: PathFrame[])
 function buildLantern(site: Site, rng: Rng): PartBuilder | null {
   const b = new PartBuilder('props:lantern');
   const wall = site.front;
-  const door = site.layout.door;
+  const { door, doorHood: hood } = site.layout;
   const dc = (door.u0 + door.u1) / 2;
   const reach = 0.32; // w of the lantern's axis
-  // Arm level with the door head; lower when an eave or jetty comes down close.
+  // Arm level with the door head, but under the ceiling the layout keeps for
+  // the hood (joist ends, storey band, eave); lower still when an eave or a
+  // jetty comes down close in front of the wall.
   const below = wallPoint(wall, dc, 0, reach + 0.12);
   const head = site.headroomAt(below.x, below.z);
-  const armY = Math.min(door.y1 - 0.02, wall.y1 - 0.22, head - 0.05);
+  const armY = Math.min(door.y1 - 0.02, hood.y1 - 0.1, wall.y1 - 0.22, head - 0.05);
   const fitsWall = armY - LANTERN_HEIGHT > door.y0 + 1.0;
 
   if (fitsWall) {
     const sides = rng.chance(0.5) ? [1, -1] : [-1, 1];
+    const gap = rng.range(0.05, 0.1);
     for (const side of sides) {
-      const lu = dc + side * ((door.u1 - door.u0) / 2 + 0.5);
-      if (!lanternClear(wall, lu, armY)) continue;
+      // Just outside the hood zone (and the door surround), with a hand's gap.
+      const edge = side > 0 ? Math.max(hood.u1, door.surround.u1) : Math.min(hood.u0, door.surround.u0);
+      const lu = edge + side * (LANTERN_HALF + gap);
+      if (!lanternClear(wall, lu, armY, hood)) continue;
       addWallBracket(b, rng, wallMatrix(wall, lu, armY, 0), reach);
       addLantern(b, rng, wallMatrix(wall, lu, armY - 0.012, reach));
       site.addZone(wall, { u0: lu - 0.2, u1: lu + 0.2, yLow: armY - LANTERN_HEIGHT - 0.1 });
@@ -891,15 +931,17 @@ function buildLantern(site: Site, rng: Rng): PartBuilder | null {
   return buildLanternPost(site, rng, b);
 }
 
-/** True when a wall lantern at u = lu (arm at armY) stays clear of the wall's openings. */
-function lanternClear(wall: WallSpec, lu: number, armY: number): boolean {
-  const r = { u0: lu - 0.17, u1: lu + 0.17, y0: armY - LANTERN_HEIGHT - 0.04, y1: armY + 0.08 };
+/**
+ * True when a wall lantern at u = lu (arm at armY) stays clear of the wall's
+ * openings and of the zone the layout reserves above the door for its hood.
+ */
+function lanternClear(wall: WallSpec, lu: number, armY: number, hood: HouseLayout['doorHood']): boolean {
+  const r = { u0: lu - LANTERN_HALF, u1: lu + LANTERN_HALF, y0: armY - LANTERN_HEIGHT - 0.04, y1: armY + 0.08 };
   if (r.u0 < 0.3 || r.u1 > wall.length - 0.3) return false;
+  const pad = 0.03;
+  if (r.u0 < hood.u1 + pad && r.u1 > hood.u0 - pad && r.y1 > hood.y0 - pad && r.y0 < hood.y1 + pad) return false;
   return wall.openings.every((o) => {
-    if (o.kind === 'door') {
-      // The canopy spans the lintel ± 0.15.
-      return r.u0 >= o.lintel.u1 + 0.15 || r.u1 <= o.lintel.u0 - 0.15;
-    }
+    if (o.kind === 'door') return r.u0 >= o.surround.u1 + pad || r.u1 <= o.surround.u0 - pad;
     const shutter = o.shutters ? (o.u1 - o.u0) / 2 + 0.05 : 0;
     const u0 = Math.min(o.surround.u0, o.u0 - shutter) - 0.04;
     const u1 = Math.max(o.surround.u1, o.u1 + shutter) + 0.04;

@@ -31,11 +31,10 @@ export const part: PartDef = {
   label: 'Stonework',
   explode: [0, 0, 0],
   build: ({ layout, rng }) => {
-    // Very large stone houses get stones with a coarser outline to stay near budget.
-    const detail = stoneArea(layout) * TRIANGLES_PER_M2 > TRIANGLE_BUDGET ? 2 : 3;
+    const lod = stoneLod(layout);
     return layout.storeys
       .filter((storey) => storey.style === 'stone')
-      .flatMap((storey) => buildStorey(layout, storey, detail, rng.fork(`storey${storey.index}`)));
+      .flatMap((storey) => buildStorey(layout, storey, lod, rng.fork(`storey${storey.index}`)));
   },
 };
 
@@ -72,9 +71,14 @@ const FACE_JITTER = 0.003;
  * joists reach this far into the gable faces.
  */
 const JOIST_DEPTH = 0.1;
-/** Rough stonework triangles per m² of stone face, and the budget from ARCHITECTURE.md. */
+/**
+ * Rough stonework triangles per m² of stone face at full detail and normal
+ * stone size, and what we aim for (ARCHITECTURE.md budgets 120k; keep margin).
+ */
 const TRIANGLES_PER_M2 = 450;
-const TRIANGLE_BUDGET = 120_000;
+const TRIANGLE_TARGET = 100_000;
+/** Largest stone size scale on a huge stone house. */
+const MAX_SCALE = 1.3;
 /** Ignore overlaps thinner than this (touching rectangles). */
 const EPS = 0.002;
 
@@ -108,6 +112,18 @@ interface Quoin extends Band {
   alongB: number;
 }
 
+/**
+ * Level of detail of the stonework. Big houses are seen from further away,
+ * so their stones get a coarser outline and grow a little (fewer, larger
+ * stones keep the same texture on screen and the house near budget).
+ */
+interface Lod {
+  /** Outline points per stone corner: 3 (round) or 2 (cut corner). */
+  perCorner: 2 | 3;
+  /** Stone / course size multiplier (1 = normal). */
+  scale: number;
+}
+
 /** Highest allowed y at wall-local (u, w): the roof underside minus clearance. */
 type Ceiling = (u: number, w: number) => number;
 
@@ -125,20 +141,20 @@ interface WallJob {
   obstacles: Rect[];
   stoneColor: THREE.Color;
   paint: Paint;
-  /** Outline points per stone corner: 3 (round) or 2 (cut corner, for huge houses). */
-  detail: number;
+  lod: Lod;
   /**
-   * Gable wall under a jetty: a thin course of stones at the joist level,
-   * between the corner joists (the eave walls leave that zone to the joists).
+   * Under a jetty: a thin course of stones at the joist level, between the
+   * corner joists. On the eave walls the joist ends come through it, so it is
+   * packed with small stones (`packed`) that the joists cover where they meet.
    */
-  levelling: Band | null;
+  levelling: (Band & { packed: boolean }) | null;
 }
 
 // ---------------------------------------------------------------------------
 // Storey
 // ---------------------------------------------------------------------------
 
-function buildStorey(layout: HouseLayout, storey: StoreySpec, detail: number, rng: Rng): PartBuilder[] {
+function buildStorey(layout: HouseLayout, storey: StoreySpec, lod: Lod, rng: Rng): PartBuilder[] {
   const pal = layout.params.palette;
   const isTop = storey.index === layout.storeys.length - 1;
   const walls = storey.walls;
@@ -149,9 +165,9 @@ function buildStorey(layout: HouseLayout, storey: StoreySpec, detail: number, rn
   const joists = storey.joistZone;
   const yEnd = isTop ? storey.y1 - 0.015 - 0.03 * Math.tan(layout.roof.pitch) : storey.y1 - joists;
 
-  const bands = quoinBands(yStart, yEnd, walls.flatMap(openingLines), rng.fork('bands'));
+  const bands = quoinBands(yStart, yEnd, walls.flatMap(openingLines), lod.scale, rng.fork('bands'));
   // corners[i] sits at the END of walls[i] = the START of walls[i + 1].
-  const corners = walls.map((wall, i) => planCorner(wall, walls[(i + 1) % 4], bands, rng.fork(`corner${i}`)));
+  const corners = walls.map((wall, i) => planCorner(wall, walls[(i + 1) % 4], bands, lod.scale, rng.fork(`corner${i}`)));
 
   const out: PartBuilder[] = [];
   walls.forEach((wall, i) => {
@@ -166,8 +182,8 @@ function buildStorey(layout: HouseLayout, storey: StoreySpec, detail: number, rn
       obstacles: [],
       stoneColor: new THREE.Color(pal.stone),
       paint: facePaint(storey, [wall]),
-      detail,
-      levelling: joists > 0 && wall.isGable ? { y0: yEnd, y1: storey.y1 } : null,
+      lod,
+      levelling: joists > 0 ? { y0: yEnd, y1: storey.y1, packed: !wall.isGable } : null,
     };
     layWall(job, bands, corners[(i + 3) % 4], corners[i], storey.index === 0);
     out.push(builder);
@@ -188,20 +204,20 @@ function buildStorey(layout: HouseLayout, storey: StoreySpec, detail: number, rn
  * are ~0.36–0.52 m, snapped onto nearby opening lines so the coursing meets
  * sills and lintels cleanly.
  */
-function quoinBands(y0: number, y1: number, targets: number[], rng: Rng): number[] {
+function quoinBands(y0: number, y1: number, targets: number[], scale: number, rng: Rng): number[] {
   const lines = [y0];
   let y = y0;
   for (;;) {
     const rest = y1 - y;
-    if (rest <= 0.56) break;
+    if (rest <= 0.56 * scale) break;
     let next: number;
-    if (rest <= 0.95) {
+    if (rest <= 0.95 * scale) {
       next = y + rest * rng.range(0.45, 0.55);
     } else {
       // Bigger corner stones low down, a little smaller higher up.
-      const low = y - y0 < 0.9;
-      next = y + (low ? rng.range(0.4, 0.52) : rng.range(0.36, 0.48));
-      const snap = nearest(targets, next, 0.1, (t) => t - y >= 0.28 && y1 - t >= 0.3);
+      const low = y - y0 < 0.9 * scale;
+      next = y + (low ? rng.range(0.4, 0.52) : rng.range(0.36, 0.48)) * scale;
+      const snap = nearest(targets, next, 0.1 * scale, (t) => t - y >= 0.28 * scale && y1 - t >= 0.3 * scale);
       if (snap !== null) next = snap;
     }
     lines.push(next);
@@ -221,13 +237,13 @@ function quoinBands(y0: number, y1: number, targets: number[], rng: Rng): number
  * every course. The short side stays thinner than the wall so the stone stays
  * inside the masonry (it never shows on the inside).
  */
-function planCorner(a: WallSpec, b: WallSpec, bands: number[], rng: Rng): Quoin[] {
+function planCorner(a: WallSpec, b: WallSpec, bands: number[], scale: number, rng: Rng): Quoin[] {
   const maxShort = Math.max(0.14, a.thickness - 0.04);
   const flip = rng.chance(0.5);
   const quoins: Quoin[] = [];
   for (let k = 0; k + 1 < bands.length; k++) {
     const band = { y0: bands[k], y1: bands[k + 1] };
-    const long = rng.range(0.44, 0.6);
+    const long = rng.range(0.44, 0.6) * scale;
     const short = Math.min(maxShort, rng.range(0.24, 0.32));
     const aLong = (k % 2 === 0) !== flip;
     let alongA = aLong ? long : short;
@@ -317,7 +333,7 @@ function layWall(job: WallJob, bands: number[], startCorner: Quoin[], endCorner:
     job.obstacles.push({ u0: wall.length - q.alongA - QUOIN_JOINT, u1: wall.length + 1, y0: q.y0, y1: q.y1 });
   }
 
-  const lines = wallCourses(wall, bands, ground, job.rng);
+  const lines = wallCourses(wall, bands, ground, job.lod.scale, job.rng);
   if (job.levelling) {
     const { y0, y1 } = job.levelling;
     lines.push(y1);
@@ -331,8 +347,10 @@ function layWall(job: WallJob, bands: number[], startCorner: Quoin[], endCorner:
     const [uMin, uMax] = courseExtent(job, course);
     if (uMax - uMin < MIN_GAP_STONE) continue;
     const joints: number[] = [];
+    const packed = job.levelling?.packed && course.y0 >= job.levelling.y0 - EPS;
     for (const piece of freePieces(course, uMin, uMax, job.obstacles)) {
-      fillPiece(job, piece, piece.full ? above : null, belowJoints, joints);
+      if (packed) packPiece(job, piece);
+      else fillPiece(job, piece, piece.full ? above : null, belowJoints, joints);
     }
     belowJoints = joints;
   }
@@ -343,14 +361,14 @@ function layWall(job: WallJob, bands: number[], startCorner: Quoin[], endCorner:
  * two courses, continued up the gable triangle, then nudged onto the wall's
  * own sill / lintel lines. Band lines stay put so the courses meet the quoins.
  */
-function wallCourses(wall: WallSpec, bands: number[], ground: boolean, rng: Rng): number[] {
+function wallCourses(wall: WallSpec, bands: number[], ground: boolean, scale: number, rng: Rng): number[] {
   const lines: { y: number; locked: boolean }[] = [{ y: bands[0], locked: true }];
   for (let k = 0; k + 1 < bands.length; k++) {
     const y0 = bands[k];
     const h = bands[k + 1] - y0;
     // The footing course of the house is mostly left whole: big stones at the base.
     const splitChance = ground && k === 0 ? 0.3 : 0.85;
-    if (h >= 0.5 || (h >= 0.38 && rng.chance(splitChance))) lines.push({ y: y0 + h * rng.range(0.4, 0.6), locked: false });
+    if (h >= 0.5 * scale || (h >= 0.38 * scale && rng.chance(splitChance))) lines.push({ y: y0 + h * rng.range(0.4, 0.6), locked: false });
     lines.push({ y: bands[k + 1], locked: true });
   }
   if (wall.gable) {
@@ -359,7 +377,7 @@ function wallCourses(wall: WallSpec, bands: number[], ground: boolean, rng: Rng)
     const rise = Math.max(0.5, apex - wall.y1);
     let y = lines[lines.length - 1].y;
     while (apex - y > MIN_STONE_H + 0.03) {
-      y += rng.range(0.2, 0.3) * (1 - 0.25 * Math.min(1, (y - wall.y1) / rise));
+      y += rng.range(0.2, 0.3) * scale * (1 - 0.25 * Math.min(1, (y - wall.y1) / rise));
       lines.push({ y, locked: false });
     }
   }
@@ -466,10 +484,11 @@ function subtract(bands: Band[], o: Rect): Band[] {
  */
 function fillPiece(job: WallJob, piece: Piece, above: Band | null, belowJoints: number[], joints: number[]): void {
   const { rng } = job;
+  const S = job.lod.scale;
   const width = piece.u1 - piece.u0;
   const height = piece.y1 - piece.y0;
   if (width < MIN_GAP_STONE) return;
-  const run = bestRun(width, rng, belowJoints, piece.u0);
+  const run = bestRun(width, S, rng, belowJoints, piece.u0);
   let u = piece.u0;
   run.lengths.forEach((len, i) => {
     const s0 = u;
@@ -477,14 +496,14 @@ function fillPiece(job: WallJob, piece: Piece, above: Band | null, belowJoints: 
     if (i > 0) joints.push(s0 - run.joints[i - 1] / 2);
     u = s1 + (run.joints[i] ?? 0);
 
-    if (above && len >= 0.22 && len <= 0.62 && above.y1 - piece.y0 <= 0.6 && rng.chance(0.08) && canJump(job, s0, s1, above)) {
+    if (above && len >= 0.22 * S && len <= 0.62 * S && above.y1 - piece.y0 <= 0.6 * S && rng.chance(0.08) && canJump(job, s0, s1, above)) {
       // A tall stone spanning two courses breaks up the grid.
       addFieldStone(job, s0, s1, piece.y0 + bedJoint(rng), above.y1 - bedJoint(rng));
       const j = rng.range(0.01, 0.02);
       job.obstacles.push({ u0: s0 - j, u1: s1 + j, y0: piece.y0, y1: above.y1 });
       return;
     }
-    if (piece.full && height >= 0.27 && len >= 0.2 && len <= 0.55 && rng.chance(0.07)) {
+    if (piece.full && height >= 0.27 * S && len >= 0.2 * S && len <= 0.55 * S && rng.chance(0.07)) {
       // Two thin stones stacked in one slot.
       const split = piece.y0 + height * rng.range(0.42, 0.58);
       const shrink = rng.range(0, Math.min(0.08, len - MIN_STONE));
@@ -498,6 +517,29 @@ function fillPiece(job: WallJob, piece: Piece, above: Band | null, belowJoints: 
     const lift = slack * rng.pick([0, 0.5, 1]);
     addFieldStone(job, s0, s1, piece.y0 + bedJoint(rng) + lift, piece.y1 - bedJoint(rng) - (slack - lift));
   });
+}
+
+/**
+ * Fill the joist course of an eave wall with small packing stones. The joist
+ * ends (timber) come out of the wall somewhere along it; small stones read
+ * as packed in around them wherever they land, and a joist simply hides the
+ * part of a stone behind it.
+ */
+function packPiece(job: WallJob, piece: Piece): void {
+  const { rng } = job;
+  const h = piece.y1 - piece.y0;
+  let u = piece.u0 + rng.range(0.004, 0.01);
+  while (piece.u1 - u >= MIN_GAP_STONE) {
+    let len = rng.range(0.13, 0.24);
+    if (piece.u1 - u - len < MIN_STONE + 0.02) len = piece.u1 - u - rng.range(0.004, 0.01);
+    if (len < MIN_GAP_STONE) break;
+    // A little low or high in the course, like hand-set pinnings.
+    const slack = rng.range(0, Math.min(0.02, h * 0.15));
+    const lift = slack * rng.next();
+    // Small and in the jetty's shadow: the cut-corner outline is plenty.
+    addFieldStone(job, u, u + len, piece.y0 + bedJoint(rng) + lift, piece.y1 - bedJoint(rng) - (slack - lift), 2);
+    u += len + rng.range(0.012, 0.024);
+  }
 }
 
 /** Half of a bed (horizontal) joint: joints end up ≈ 1–2.2 cm. */
@@ -524,11 +566,11 @@ interface Run {
  * Stone lengths for a free width: a few random runs, keeping the one whose
  * vertical joints stay furthest from the joints of the course below.
  */
-function bestRun(width: number, rng: Rng, belowJoints: number[], u0: number): Run {
-  let best = randomRun(width, rng);
+function bestRun(width: number, scale: number, rng: Rng, belowJoints: number[], u0: number): Run {
+  let best = randomRun(width, scale, rng);
   let bestScore = jointScore(best, belowJoints, u0);
   for (let attempt = 0; attempt < 4 && bestScore < 0.09; attempt++) {
-    const run = randomRun(width, rng);
+    const run = randomRun(width, scale, rng);
     const score = jointScore(run, belowJoints, u0);
     if (score > bestScore) {
       best = run;
@@ -539,8 +581,8 @@ function bestRun(width: number, rng: Rng, belowJoints: number[], u0: number): Ru
 }
 
 /** Random stone lengths (≈0.25–0.75 m, occasionally a long one) exactly filling `width`. */
-function randomRun(width: number, rng: Rng): Run {
-  const target = rng.range(0.4, 0.6);
+function randomRun(width: number, scale: number, rng: Rng): Run {
+  const target = rng.range(0.4, 0.6) * scale;
   const n = Math.max(1, Math.round(width / target));
   const joints = Array.from({ length: n - 1 }, () => rng.range(0.01, 0.024));
   const weights = Array.from({ length: n }, () => (rng.chance(0.12) ? rng.range(1.5, 1.9) : rng.range(0.6, 1.25)));
@@ -577,7 +619,7 @@ function jointScore(run: Run, belowJoints: number[], u0: number): number {
  * One rounded field stone filling [u0, u1] × [y0, y1] on the wall face, with a
  * small random tilt and a colour of its own.
  */
-function addFieldStone(job: WallJob, u0: number, u1: number, y0: number, y1: number): void {
+function addFieldStone(job: WallJob, u0: number, u1: number, y0: number, y1: number, perCorner = job.lod.perCorner): void {
   const { rng } = job;
   const len = u1 - u0;
   const h = y1 - y0;
@@ -592,7 +634,7 @@ function addFieldStone(job: WallJob, u0: number, u1: number, y0: number, y1: num
     crown: face + rng.range(0.005, 0.014),
     inset: Math.min(small * 0.28, rng.range(0.028, 0.05)),
   };
-  const g = fieldStoneGeometry(len, h, profile, job.detail, rng);
+  const g = fieldStoneGeometry(len, h, profile, perCorner, rng);
   const lump = Math.min(0.004, small * 0.03);
   lumpify(g, lump, rng.int(0, 1e6));
 
@@ -883,6 +925,23 @@ function facePaint(storey: StoreySpec, walls: WallSpec[]): Paint {
       if (k > 0) out.lerp(DAMP, 0.18 * k * k);
     }
   };
+}
+
+/**
+ * Level of detail for a house. `layout.detail` drops below 1 on big houses:
+ * their stones lose the round corner points and grow a little (up to +25 %).
+ * If the estimated triangle count is still over target, the stones grow
+ * further (up to MAX_SCALE).
+ */
+function stoneLod(layout: HouseLayout): Lod {
+  const area = stoneArea(layout);
+  const coarse = THREE.MathUtils.clamp(1 - layout.detail, 0, 0.55);
+  let scale = 1 + 0.45 * coarse;
+  let perCorner: 2 | 3 = layout.detail < 0.72 ? 2 : 3;
+  const estimate = () => (area * TRIANGLES_PER_M2 * (perCorner === 2 ? 0.7 : 1)) / (scale * scale);
+  if (estimate() > TRIANGLE_TARGET) perCorner = 2;
+  if (estimate() > TRIANGLE_TARGET) scale = Math.min(MAX_SCALE, scale * Math.sqrt(estimate() / TRIANGLE_TARGET));
+  return { perCorner, scale };
 }
 
 /** Approximate stone-faced area of the house (walls and gables minus openings), m². */

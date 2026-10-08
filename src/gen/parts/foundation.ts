@@ -3,6 +3,7 @@ import { PartBuilder, lumpify, mix, mul, vary } from '../builder';
 import { wallExplode } from '../explode';
 import type { PartDef } from '../house';
 import type { HouseLayout, WallSpec } from '../layout';
+import type { WallStyle } from '../params';
 import type { Rng } from '../rng';
 
 /**
@@ -54,8 +55,15 @@ const BAND = {
   frontJitter: 0.012,
   /** The top course stays just below floorY so it never fights the door hole's floor. */
   topBelowFloor: 0.009,
-  /** How far the outer top edge of the top course drops (weathering slope). */
-  weathering: 0.024,
+  /**
+   * Weathering: the top course's top slopes down from just in front of the
+   * wall face to the band's front, by this fraction of the run (a low plinth
+   * gets the steeper `weatheringLow`, so it reads as a chamfered base course).
+   */
+  weathering: 0.36,
+  weatheringLow: 0.95,
+  /** A low plinth is buried this much deeper, so its blocks rise straight out of the ground. */
+  buryLow: 0.06,
   /** Mortar joint between blocks. */
   joint: 0.016,
   /** Hand-made irregularity of each block. */
@@ -101,6 +109,15 @@ interface Course {
   /** Front face (w) of the blocks in this course. */
   front: number;
   isTop: boolean;
+  /** Top course: how far its top drops at the front (weathering), and where the slope starts (w). */
+  weathering: number;
+  slopeFrom: number;
+  /** 0: the weathering is a soft S-curve; 1: a straight chamfer (low plinths). */
+  chamfer: number;
+  /** Edge radius of the blocks. */
+  radius: number;
+  /** Block length multiplier. */
+  lengthScale: number;
 }
 
 /** The block that turns one corner in one course. */
@@ -118,7 +135,7 @@ function buildPlinth(layout: HouseLayout, rng: Rng, slabs: StepSlab[]): PartBuil
   const walls = ground.walls;
   const pal = layout.params.palette;
   const base = mix(pal.stone, '#4f4a44', 0.32);
-  const courses = planCourses(ground.floorY, [...new Set(slabs.map((s) => s.y1))]);
+  const courses = planCourses(ground.floorY, ground.style, [...new Set(slabs.map((s) => s.y1))]);
   const corners = courses.map((c) => planCorners(c, walls, rng));
   // On the door wall, keep joints off the sides of the step slabs too.
   const stepEdges = slabs.flatMap((s) => [s.u0, s.u1]);
@@ -151,8 +168,7 @@ function buildPlinth(layout: HouseLayout, rng: Rng, slabs: StepSlab[]): PartBuil
         addCornerBlock(b, wall, course, 'end', atEnd, base, rng);
       }
 
-      // Taller courses get longer blocks, so proportions stay chunky.
-      const lengthScale = clamp((course.y1 - course.y0) / 0.24, 0.85, 1.4);
+      const lengthScale = course.lengthScale;
       const avoid = wall.id === layout.stoop.wallId ? [...jointsBelow[j], ...stepEdges] : jointsBelow[j];
       const cuts = splitRun(runStart, runEnd, 0.65 * lengthScale, 1.15 * lengthScale, avoid, rng);
       for (let i = 0; i + 1 < cuts.length; i++) {
@@ -171,14 +187,18 @@ function buildPlinth(layout: HouseLayout, rng: Rng, slabs: StepSlab[]): PartBuil
  * Split the plinth height into level courses. Course boundaries are nudged
  * away from the step tops so no tread is ever coplanar with a block top.
  */
-function planCourses(floorY: number, stepTops: number[]): Course[] {
+function planCourses(floorY: number, style: WallStyle, stepTops: number[]): Course[] {
+  const low = lowness(floorY);
+  const bottom = plinthBottom(floorY);
   const top = floorY - BAND.topBelowFloor;
   const height = top - BAND.bottom;
   const n = clamp(Math.round(height / BAND.courseTarget), 1, 3);
   // A slightly taller bottom course and shallower top course read as heavier at the base.
   const weights = Array.from({ length: n }, (_, i) => (n === 1 ? 1 : i === 0 ? 1.15 : i === n - 1 ? 0.9 : 1));
   const total = weights.reduce((s, w) => s + w, 0);
-  const levels = [BAND.bottom];
+  // The weathering starts in front of whatever stands on the plinth (stone faces, a timber sill).
+  const slopeFrom = style === 'stone' ? 0.03 : style === 'timber' ? 0.035 : 0;
+  const levels = [bottom];
   let acc = BAND.bottom;
   for (let i = 0; i < n - 1; i++) {
     acc += (height * weights[i]) / total;
@@ -187,13 +207,37 @@ function planCourses(floorY: number, stepTops: number[]): Course[] {
     levels.push(blockTop + BAND.joint / 2);
   }
   levels.push(top);
-  return weights.map((_, i) => ({
-    index: i,
-    y0: levels[i] + (i > 0 ? BAND.joint / 2 : 0),
-    y1: levels[i + 1] - (i < n - 1 ? BAND.joint / 2 : 0),
-    front: BAND.front - BAND.batter * i,
-    isTop: i === n - 1,
-  }));
+  return weights.map((_, i) => {
+    const front = BAND.front - BAND.batter * i;
+    const isTop = i === n - 1;
+    // Visible height (the buried part does not count).
+    const h = levels[i + 1] - Math.max(levels[i], BAND.bottom);
+    return {
+      index: i,
+      y0: levels[i] + (i > 0 ? BAND.joint / 2 : 0),
+      y1: levels[i + 1] - (i < n - 1 ? BAND.joint / 2 : 0),
+      front,
+      isTop,
+      weathering: isTop ? (front - slopeFrom) * (BAND.weathering + (BAND.weatheringLow - BAND.weathering) * low) : 0,
+      slopeFrom,
+      chamfer: low,
+      // A low base course is dressed crisper, so its chamfer reads.
+      radius: clamp(h * 0.26, 0.03, 0.05) * (1 - 0.45 * low),
+      // Taller courses get longer blocks, so proportions stay chunky; a low
+      // base course is laid in long dressed lengths.
+      lengthScale: Math.max(clamp(h / 0.24, 0.85, 1.4), 0.85 + 0.4 * low),
+    };
+  });
+}
+
+/** 1 for a very low plinth (≤ 0.15 m), 0 from 0.4 m up. */
+function lowness(floorY: number): number {
+  return clamp((0.4 - floorY) / 0.25, 0, 1);
+}
+
+/** Bottom of the plinth: a low plinth goes deeper, so its blocks rise straight out of the ground. */
+function plinthBottom(floorY: number): number {
+  return BAND.bottom - BAND.buryLow * lowness(floorY);
 }
 
 /** Corner blocks for one course; the long side alternates between the two walls per course. */
@@ -259,8 +303,7 @@ function addBlock(
   const sy = course.y1 - course.y0;
   const sz = e.w1 - e.w0;
   const c = new THREE.Vector3((e.u0 + e.u1) / 2, (course.y0 + course.y1) / 2, (e.w0 + e.w1) / 2);
-  const radius = clamp(sy * 0.26, 0.03, 0.05);
-  const g = roundedBlock(sx, sy, sz, radius, [sx > 0.8 ? 2 : 1, 1, 1]);
+  const g = roundedBlock(sx, sy, sz, course.radius, [sx > 0.8 ? 2 : 1, 1, 1]);
   g.translate(c.x, c.y, c.z);
 
   if (course.isTop) {
@@ -270,9 +313,11 @@ function addBlock(
       const u = pos.getX(i);
       const y = pos.getY(i);
       const w = pos.getZ(i);
-      const out = Math.max(clamp(w / P, 0, 1), overNeighbour ? clamp(overNeighbour(u), 0, 1) : 0);
+      const run = (v: number) => clamp((v - course.slopeFrom) / (P - course.slopeFrom), 0, 1);
+      const out = Math.max(run(w), overNeighbour ? run(overNeighbour(u) * P) : 0);
       const up = clamp((y - c.y) / (sy / 2), 0, 1);
-      pos.setY(i, y - BAND.weathering * smooth(out) * up);
+      const profile = smooth(out) + (out - smooth(out)) * course.chamfer;
+      pos.setY(i, y - course.weathering * profile * up);
     }
   }
   roughen(g, BAND.lump, rng.int(0, 1e6));
@@ -327,10 +372,11 @@ function buildMortarBed(layout: HouseLayout, rng: Rng): PartBuilder {
   const top = g0.floorY - BED.topBelowFloor;
   const shape = rectPath(new THREE.Shape(), g0.minX - BED.front, g0.maxX + BED.front, g0.minZ - BED.front, g0.maxZ + BED.front);
   shape.holes.push(rectPath(new THREE.Path(), g0.minX - BED.back, g0.maxX + BED.back, g0.minZ - BED.back, g0.maxZ + BED.back));
-  const geom = new THREE.ExtrudeGeometry(shape, { depth: top - BAND.bottom, bevelEnabled: false });
+  const bottom = plinthBottom(g0.floorY);
+  const geom = new THREE.ExtrudeGeometry(shape, { depth: top - bottom, bevelEnabled: false });
   // Shape (x, -z) extruded along +z → lying flat, extruded up.
   geom.rotateX(-Math.PI / 2);
-  geom.translate(0, BAND.bottom, 0);
+  geom.translate(0, bottom, 0);
   b.add(geom, 'mortar', vary(mix(layout.params.palette.mortar, '#6b655c', 0.15), rng, 0.02, 0.02, 0));
   return b;
 }
