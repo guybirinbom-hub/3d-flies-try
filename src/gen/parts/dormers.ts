@@ -63,7 +63,7 @@ const RECESS = -0.055;
 
 const LEAD = '#737c85';
 const GLASS = '#3a5566';
-const GLASS_SKY = '#8eaab8';
+const GLASS_SKY = '#b4cdd6';
 const IRON = '#3a3430';
 const SOIL = '#4b3727';
 const MOSS = '#5f6f45';
@@ -182,7 +182,7 @@ function chooseLook(layout: HouseLayout, rng: Rng): Look {
   return {
     pal,
     cheek,
-    glazing: rng.chance(0.55) ? 'cross' : 'six',
+    glazing: layout.glazing,
     trim: new THREE.Color(rng.chance(0.65) ? pal.timber : pal.wood),
     plaster: vary(pal.plaster, rng, 0.01, 0.015, 0.003),
     mortar: vary(pal.mortar, rng, 0.02, 0.02, 0),
@@ -869,7 +869,9 @@ function buildWindow(k: Kit, rng: Rng): void {
   const sky = new THREE.Color(GLASS_SKY);
   const h = Math.max(0.1, w.y1 - w.y0);
   put(k, extrudeLocal(glass, 0.008, RECESS - 0.018, 10), 'glass', vary(GLASS, rng, 0.03, 0.04, 0.008), F, (p, _n, out) => {
-    out.lerp(sky, 0.42 * clamp((p.y - w.y0) / h, 0, 1));
+    // Same sky reflection as the wall windows (openings part).
+    const t = clamp((p.y - w.y0) / h, 0, 1);
+    out.lerp(sky, 0.06 + 0.56 * t * t);
   });
 
   // Glazing bars.

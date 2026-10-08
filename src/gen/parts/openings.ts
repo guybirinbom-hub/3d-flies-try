@@ -118,7 +118,7 @@ function chooseLook(layout: HouseLayout, rng: Rng): Look {
   const pal = layout.params.palette;
   const painted = rng.chance(0.4);
   return {
-    glazing: rng.chance(0.55) ? 'cross' : 'sixPane',
+    glazing: layout.glazing === 'cross' ? 'cross' : 'sixPane',
     shutterStyle: rng.weighted([
       ['braced', 5],
       ['heart', 3],

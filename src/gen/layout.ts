@@ -268,6 +268,8 @@ export interface HouseLayout {
    * around the triangle budget.
    */
   detail: number;
+  /** Window glazing used throughout the house (wall and dormer windows match). */
+  glazing: 'cross' | 'six';
   /** World-space bounds of the whole house including roof overhang and chimney. */
   bounds: { min: Vector3; max: Vector3 };
 }
@@ -638,7 +640,9 @@ export function computeLayout(p: HouseParams): HouseLayout {
   }
   const detail = clamp(220 / wallArea, 0.45, 1);
 
-  return { params: p, storeys, walls, openings: allOpenings, door: d, stoop, doorHood, roof, chimney, detail, bounds };
+  const glazing = rng.fork('glazing').chance(0.55) ? 'cross' : 'six';
+
+  return { params: p, storeys, walls, openings: allOpenings, door: d, stoop, doorHood, roof, chimney, detail, glazing, bounds };
 }
 
 type WallPattern = 'full' | 'sparse' | 'centre' | 'blank';
