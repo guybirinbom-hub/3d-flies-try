@@ -8,13 +8,16 @@ import type { Palette } from '../params';
 import type { Rng } from '../rng';
 
 /**
- * Props: the life around the house. A path from the door steps that fades
- * into the lawn, a lantern beside the door hood, pots beside the steps, a
- * lean-to woodshed against a gable (or a plain woodpile), a bench and
- * barrels against the walls, a climbing rose or ivy up a corner or beside
- * the door, flower spikes, groups of shrubs and flowers along the base and
- * grass tufts that blend the house into the ground. Small repeated detail
- * thins out with `layout.detail` and the part's triangle budget.
+ * Props: the life around the house. On most houses a garden plot: a picket
+ * fence or dry-stone wall round the front with a gate where the path leaves,
+ * a vegetable or flower bed, fruit trees off to one side and a shrub group.
+ * A path from worn earth at the foot of the steps out through the gate (or
+ * into a little gravel patch), a lantern beside the door hood, pots beside
+ * the steps, a lean-to woodshed against a gable (or a plain woodpile), a
+ * bench and barrels against the walls, a climbing rose or ivy up a corner or
+ * beside the door, flower spikes, groups of shrubs and flowers along the
+ * base and grass tufts that blend the house into the ground. Small repeated
+ * detail thins out with `layout.detail` and the part's triangle budget.
  *
  * Everything is placed on a small site plan (`Site`): every item claims an
  * oriented rectangle on the ground so nothing overlaps the house, the stoop,
@@ -30,10 +33,16 @@ export const part: PartDef = {
     if (!layout.params.props) return new PartBuilder('props');
     const site = new Site(layout);
     const beds = new Beds(site);
-    // Order matters: earlier items claim their ground first. The path and the
-    // lantern are the most important; plants and grass fill in around the rest.
+    // Order matters: earlier items claim their ground first. The garden's
+    // fence and the path through its gate come first (they shape the plot),
+    // then the lantern; plants and grass fill in around the rest.
+    const pathRng = rng.fork('path');
+    const look = pathLook(pathRng);
+    const garden = planGarden(site, rng.fork('garden'), look.halfWidth);
+    const fence = garden ? buildFence(site, rng.fork('fence'), garden) : null;
     const builders = [
-      buildPath(site, rng.fork('path')),
+      buildPath(site, pathRng, look, garden),
+      fence,
       buildLantern(site, rng.fork('lantern')),
       buildStoopPots(site, rng.fork('pots')),
     ];
@@ -46,9 +55,13 @@ export const part: PartDef = {
     buildSpikes(site, beds, rng.fork('spikes'));
     if (!shed) builders.push(buildWoodpile(site, rng.fork('woodpile')));
     builders.push(buildBench(site, rng.fork('bench')), buildBarrels(site, rng.fork('barrels')));
+    // The garden's beds and trees take what room the house-side items left.
+    if (garden) builders.push(buildGardenBed(site, rng.fork('garden-bed'), garden));
+    builders.push(...buildTrees(site, rng.fork('trees'), garden));
     // Planting fills in last and thins out when the rest already used much of the budget.
     const used = builders.reduce((n, b) => n + (b?.triangles ?? 0), 0);
     buildPlanting(site, beds, rng.fork('planting'), PROPS_BUDGET - used);
+    if (fence && garden) sowFenceGrass(site, fence, rng.fork('fence-grass'), garden);
     builders.push(...beds.builders.values());
     return builders.filter((b): b is PartBuilder => b !== null && !b.isEmpty);
   },
@@ -67,7 +80,7 @@ const FLOWER_BOX_DROP = 0.42;
 /** Perimeter (m) of a house that gets full-density planting; larger houses are planted more sparsely. */
 const PLANTED_PERIMETER = 30;
 /** Triangles the whole part aims to stay under, and what planting typically takes of it. */
-const PROPS_BUDGET = 28000;
+const PROPS_BUDGET = 37000;
 const PLANTING_TYPICAL = 13000;
 /** Kept back from the planting cap for the grass tufts sown afterwards. */
 const TUFT_RESERVE = 1800;
@@ -120,7 +133,8 @@ interface Footprint {
   hw: number;
 }
 
-type ClaimKind = 'house' | 'stoop' | 'path' | 'solid' | 'plant';
+/** `fence` is solid for placement, but grass grows along its foot. */
+type ClaimKind = 'house' | 'stoop' | 'path' | 'solid' | 'plant' | 'fence';
 
 /** Part of a wall face (u-range) that anything standing in front must stay below `yLow`. */
 interface WallZone {
@@ -147,6 +161,24 @@ interface PathFrame {
   hw: number;
   /** Arc length from the stoop. */
   s: number;
+  /** 0 on the path proper, rising to 1 where it has faded into the ground at its far end. */
+  fade: number;
+}
+
+/**
+ * A soft-edged patch of worn earth or gravel on the lawn (oriented ellipse
+ * with a wobbly rim). Path ribbons blend into these instead of the grass.
+ */
+interface GroundPatch {
+  x: number;
+  z: number;
+  /** Unit axis of the `ru` radius. */
+  ax: number;
+  az: number;
+  ru: number;
+  rv: number;
+  color: THREE.Color;
+  phase: number;
 }
 
 /** Ground point at the foot of an item, where a grass tuft likes to grow. */
@@ -163,9 +195,14 @@ class Site {
   readonly anchors: TuftAnchor[] = [];
   /** Wall-mounted things (the lantern) that climbing plants must keep well away from. */
   readonly keepClear: { wall: WallSpec; u0: number; u1: number }[] = [];
+  /** Worn earth / gravel on the lawn (see `groundTint`). */
+  readonly patches: GroundPatch[] = [];
   path: PathFrame[] = [];
   private readonly zones = new Map<WallSpec, WallZone[]>();
-  private readonly claims: { fp: Footprint; kind: ClaimKind }[] = [];
+  /** Ground claims, each with the height of what stands there (for tree crowns overhead). */
+  private readonly claims: { fp: Footprint; kind: ClaimKind; h: number }[] = [];
+  /** Tree crowns: plan footprint and the height of their underside. */
+  readonly canopies: { fp: Footprint; bottom: number }[] = [];
 
   constructor(readonly layout: HouseLayout) {
     const ground = layout.storeys[0];
@@ -251,6 +288,9 @@ class Site {
     for (const s of storeys.slice(1)) {
       if (x > s.minX - 0.1 && x < s.maxX + 0.1 && Math.abs(z) < s.maxZ + 0.1) h = Math.min(h, s.y0 - 0.2);
     }
+    for (const c of this.canopies) {
+      if (overlaps(circleFootprint(x, z, 0.01), c.fp, 0.1)) h = Math.min(h, c.bottom - 0.12);
+    }
     return h;
   }
 
@@ -286,14 +326,45 @@ class Site {
    */
   grassFits(x: number, z: number): boolean {
     return this.claims.every((c) => {
-      if (c.kind === 'plant') return true;
+      // Grass grows along the foot of fences and dry-stone walls.
+      if (c.kind === 'plant' || c.kind === 'fence') return true;
       const r = c.kind === 'stoop' ? TUFT_REACH : 0.05;
       return !overlaps(circleFootprint(x, z, r), c.fp, 0);
     });
   }
 
-  claim(fp: Footprint, kind: ClaimKind): void {
-    this.claims.push({ fp, kind });
+  /**
+   * Can a tree crown whose underside is at `bottom` spread over `fp` (in
+   * plan)? Over the path, beds and anything low enough, but not over the
+   * house (it stays out from under the roof) or anything that reaches it.
+   */
+  canopyFits(fp: Footprint, bottom: number, gap = 0.1): boolean {
+    const { bounds } = this.layout;
+    const roof: Footprint = {
+      x: (bounds.min.x + bounds.max.x) / 2,
+      z: (bounds.min.z + bounds.max.z) / 2,
+      ax: 1,
+      az: 0,
+      hl: (bounds.max.x - bounds.min.x) / 2,
+      hw: (bounds.max.z - bounds.min.z) / 2,
+    };
+    if (overlaps(fp, roof, gap)) return false;
+    return this.claims.every((c) => c.h < bottom - 0.12 || !overlaps(fp, c.fp, gap));
+  }
+
+  /** Claim ground for something reaching up to height h (unknown: tall). */
+  claim(fp: Footprint, kind: ClaimKind, h = kind === 'path' || kind === 'stoop' ? 0 : kind === 'plant' ? 1.3 : Infinity): void {
+    this.claims.push({ fp, kind, h });
+  }
+
+  /** The lawn colour at (x, z), tinted by any worn-earth / gravel patches there. */
+  groundTint(x: number, z: number): THREE.Color {
+    const c = new THREE.Color(PATH_EDGE);
+    for (const p of this.patches) {
+      const w = patchWeight(p, x, z);
+      if (w > 0) c.lerp(p.color, w);
+    }
+    return c;
   }
 
   /** Footprint of the wall-local box u ∈ [u0, u1], w ∈ [w0, w1]. */
@@ -329,7 +400,7 @@ class Site {
         }
         const fp = this.standAgainst(wall, u0, u0 + len, w0, w1, h);
         if (fp) {
-          this.claim(fp, 'solid');
+          this.claim(fp, 'solid', h);
           this.anchorFront(wall, u0, u0 + len, w1);
           return { wall, u0, u1: u0 + len };
         }
@@ -652,24 +723,97 @@ const HOLLYHOCK_STEM = new THREE.CylinderGeometry(0.011, 0.017, 1, 5, 1, true).t
 
 type PathStyle = 'stepping' | 'trail' | 'flagstone';
 
-/** A gently curving path from the outer edge of the stoop out into the garden. */
-function buildPath(site: Site, rng: Rng): PartBuilder {
-  const b = new PartBuilder('props:path');
+/** What the path is made of and how wide it is (chosen first: the garden gate is sized to it). */
+interface PathLook {
+  style: PathStyle;
+  halfWidth: number;
+}
+
+function pathLook(rng: Rng): PathLook {
   const style = rng.weighted<PathStyle>([
     ['stepping', 3],
     ['trail', 4],
     ['flagstone', 3],
   ]);
-  // 3–5 m out from the steps, but never wandering more than ~4 m past the
-  // house's own bounds (high plinths make long stoops).
-  const { stoop, bounds } = site.layout;
-  const startOut = wallPoint(site.front, (stoop.u0 + stoop.u1) / 2, 0, stoop.w1).z;
-  const length = Math.max(2.4, Math.min(rng.range(3.2, 5), bounds.max.z + 4.1 - startOut));
-  const bend = (rng.chance(0.5) ? -1 : 1) * rng.range(0.3, 1.3);
   const halfWidth = style === 'stepping' ? 0.3 : style === 'trail' ? rng.range(0.36, 0.46) : rng.range(0.44, 0.54);
-  const frames = pathFrames(site, length, bend, halfWidth, rng);
+  return { style, halfWidth };
+}
+
+/** Worn earth at the foot of the steps (and the gate) and the gravel a path fades into. */
+const WORN = '#8e7b5e';
+const PATH_GRAVEL = '#a39a86';
+
+/**
+ * A path from the outer edge of the stoop: through the garden gate when
+ * there is a garden (ending just outside it), otherwise gently curving out
+ * into a little gravel patch on the lawn. Worn earth at the foot of the steps.
+ */
+function buildPath(site: Site, rng: Rng, look: PathLook, garden: Garden | null): PartBuilder {
+  const b = new PartBuilder('props:path');
+  const { style, halfWidth } = look;
+  const { stoop, bounds } = site.layout;
+  const wall = site.front;
+  let frames: PathFrame[];
+  if (garden) {
+    frames = gardenPathFrames(site, garden, halfWidth, rng);
+  } else {
+    // 3–5 m out from the steps, but never wandering more than ~4 m past the
+    // house's own bounds (high plinths make long stoops).
+    const startOut = wallPoint(wall, (stoop.u0 + stoop.u1) / 2, 0, stoop.w1).z;
+    const length = Math.max(2.4, Math.min(rng.range(3.2, 4.6), bounds.max.z + 3.2 - startOut));
+    const bend = (rng.chance(0.5) ? -1 : 1) * rng.range(0.3, 1.2);
+    frames = pathFrames(site, length, bend, halfWidth, rng);
+  }
   site.path = frames;
   for (let i = 0; i < frames.length - 1; i++) site.claim(segmentFootprint(frames[i], frames[i + 1], 0.05), 'path');
+
+  // Worn earth at the foot of the steps, and where the path fades out: a
+  // scuffed apron outside the gate, or a little gravel patch on the lawn.
+  const stoopHalf = (stoop.u1 - stoop.u0) / 2;
+  const foot = wallPoint(wall, (stoop.u0 + stoop.u1) / 2, 0, stoop.w1 + 0.14);
+  const patches: GroundPatch[] = [
+    {
+      x: foot.x,
+      z: foot.z,
+      ax: wall.dir.x,
+      az: wall.dir.z,
+      ru: stoopHalf + rng.range(0.12, 0.3),
+      rv: rng.range(0.42, 0.6),
+      color: vary(WORN, rng, 0.03, 0.03, 0.005),
+      phase: rng.range(0, 6),
+    },
+  ];
+  const last = frames[frames.length - 1];
+  if (garden) {
+    const g = garden.gate;
+    patches.push({
+      x: g.x + g.nx * 0.12,
+      z: g.z + g.nz * 0.12,
+      ax: -g.nz,
+      az: g.nx,
+      ru: garden.gateHalf + rng.range(0.12, 0.25),
+      rv: rng.range(0.5, 0.65),
+      color: vary(WORN, rng, 0.03, 0.03, 0.005),
+      phase: rng.range(0, 6),
+    });
+  } else {
+    const r = rng.range(0.62, 0.8);
+    patches.push({
+      x: last.x + last.tx * 0.15,
+      z: last.z + last.tz * 0.15,
+      ax: -last.tz,
+      az: last.tx,
+      ru: r,
+      rv: r * rng.range(0.75, 0.9),
+      color: vary(PATH_GRAVEL, rng, 0.03, 0.03, 0.005),
+      phase: rng.range(0, 6),
+    });
+  }
+  site.patches.push(...patches);
+  // The step's patch never reaches in under the steps (the stoop is the foundation's).
+  const stoopLine = { x: foot.x - wall.normal.x * 0.13, z: foot.z - wall.normal.z * 0.13, nx: wall.normal.x, nz: wall.normal.z };
+  for (const [i, p] of patches.entries()) addGroundPatch(b, rng, site, p, i === 0 ? stoopLine : null);
+  if (!garden) addGravel(b, rng, site, patches[patches.length - 1]);
 
   // Field stones are greyer and a touch darker than the dressed stone of the
   // house, so the path sits in the lawn instead of glaring pale pink-beige.
@@ -677,12 +821,12 @@ function buildPath(site: Site, rng: Rng): PartBuilder {
   if (style === 'stepping') {
     addSteppingStones(b, rng, frames, { first: 0.3, spacing: [0.55, 0.65], size: [0.22, 0.28], lateral: 0.06, stone });
   } else if (style === 'trail') {
-    addPathRibbon(b, rng, frames, new THREE.Color(DIRT));
+    addPathRibbon(b, rng, site, frames, new THREE.Color(DIRT));
     addSteppingStones(b, rng, frames, { first: 0.3, spacing: [0.65, 0.95], size: [0.18, 0.24], lateral: 0.12, stone });
     addPebbles(b, rng, frames, stone);
   } else {
     // Dark gravel joints between the flags.
-    addPathRibbon(b, rng, frames, mix(GRAVEL, DIRT, 0.25));
+    addPathRibbon(b, rng, site, frames, mix(GRAVEL, DIRT, 0.25));
     addFlagstones(b, rng, frames, stone);
   }
   addPathGrass(b, rng, site, frames);
@@ -713,7 +857,7 @@ function pathFrames(site: Site, length: number, bend: number, halfWidth: number,
     const p = curve.getPointAt(s);
     const t = curve.getTangentAt(s);
     const flare = 1 + 0.28 * (1 - smoothstep(0, 0.18, s)); // wider where it meets the steps
-    const spread = 1 + 0.3 * smoothstep(0.68, 1, s); // and spreading out as it fades into the lawn
+    const spread = 1 + 0.25 * smoothstep(0.68, 1, s); // and spreading out as it fades into the gravel
     const wobble = 1 + 0.06 * Math.sin(s * 9 + phase);
     frames.push({
       x: origin.x + wall.dir.x * p.x + wall.normal.x * p.y,
@@ -722,9 +866,137 @@ function pathFrames(site: Site, length: number, bend: number, halfWidth: number,
       tz: wall.dir.z * t.x + wall.normal.z * t.y,
       hw: halfWidth * flare * spread * wobble,
       s: s * arc,
+      fade: smoothstep(0.62, 1, s),
     });
   }
   return frames;
+}
+
+/**
+ * Path from the stoop to the garden gate: it leaves the steps straight,
+ * swings across and arrives square to the fence, narrows to pass between
+ * the gate posts and runs on a little way outside before it fades out.
+ */
+function gardenPathFrames(site: Site, garden: Garden, halfWidth: number, rng: Rng): PathFrame[] {
+  const wall = site.front;
+  const { stoop, bounds } = site.layout;
+  const origin = wallPoint(wall, (stoop.u0 + stoop.u1) / 2, 0, stoop.w1);
+  // Door space: x sideways along the wall, y outward from the stoop edge.
+  const local = (x: number, z: number) =>
+    new THREE.Vector2(x * wall.dir.x + z * wall.dir.z, x * wall.normal.x + z * wall.normal.z);
+  const { gate } = garden;
+  const g = local(gate.x - origin.x, gate.z - origin.z);
+  const n = local(gate.nx, gate.nz).normalize();
+  const tail = THREE.MathUtils.clamp(rng.range(0.45, 0.7), 0.2, bounds.max.z + 3.9 - gate.z);
+  const k = g.y * 0.42;
+  const path = new THREE.CurvePath<THREE.Vector2>();
+  path.add(new THREE.CubicBezierCurve(new THREE.Vector2(0, 0), new THREE.Vector2(0, k), g.clone().addScaledVector(n, -k), g.clone()));
+  path.add(new THREE.LineCurve(g.clone(), g.clone().addScaledVector(n, tail)));
+  const lengths = path.getCurveLengths();
+  const sGate = lengths[0];
+  const arc = lengths[1];
+  const narrow = Math.min(halfWidth, garden.gateHalf - 0.08);
+  const count = Math.max(10, Math.ceil(arc / 0.14));
+  const phase = rng.range(0, 10);
+  const frames: PathFrame[] = [];
+  for (let i = 0; i <= count; i++) {
+    const u = i / count;
+    const s = u * arc;
+    const p = path.getPointAt(u);
+    const t = path.getTangentAt(u);
+    const flare = 1 + 0.28 * (1 - smoothstep(0, 0.7, s));
+    const wobble = 1 + 0.05 * Math.sin(u * 9 + phase);
+    // Squeezed to pass the gate (from half a metre before it), and staying narrow beyond.
+    const squeeze = smoothstep(sGate - 0.75, sGate - 0.3, s);
+    const hw = THREE.MathUtils.lerp(halfWidth * flare * wobble, narrow, squeeze);
+    frames.push({
+      x: origin.x + wall.dir.x * p.x + wall.normal.x * p.y,
+      z: origin.z + wall.dir.z * p.x + wall.normal.z * p.y,
+      tx: wall.dir.x * t.x + wall.normal.x * t.y,
+      tz: wall.dir.z * t.x + wall.normal.z * t.y,
+      hw,
+      s,
+      fade: smoothstep(sGate + 0.05, arc, s),
+    });
+  }
+  return frames;
+}
+
+/** Pattern weight (0–1) of a ground patch at (x, z): 1 inside, fading out over its wobbly rim. */
+function patchWeight(p: GroundPatch, x: number, z: number): number {
+  const dx = x - p.x;
+  const dz = z - p.z;
+  const u = (dx * p.ax + dz * p.az) / p.ru;
+  const v = (-dx * p.az + dz * p.ax) / p.rv;
+  const r = Math.hypot(u, v);
+  if (r > 1.25) return 0;
+  return 1 - smoothstep(0.4, 1, r / patchRim(p, Math.atan2(v, u)));
+}
+
+/** Rim of a patch (in units of its radii) in direction a: a soft, irregular oval. */
+function patchRim(p: GroundPatch, a: number): number {
+  return 1 + 0.1 * Math.sin(3 * a + p.phase) + 0.06 * Math.sin(5 * a + p.phase * 1.7);
+}
+
+/** Height of ground decals: under the path ribbon (≥ 0.005), over the lawn. */
+const PATCH_Y = 0.003;
+
+/**
+ * The patch as a flat polar mesh whose colours come from `site.groundTint`,
+ * so it melts into the lawn and into any path or patch it overlaps. `clip`
+ * keeps it in front of a line (plan point + normal).
+ */
+function addGroundPatch(
+  b: PartBuilder,
+  rng: Rng,
+  site: Site,
+  p: GroundPatch,
+  clip: { x: number; z: number; nx: number; nz: number } | null,
+): void {
+  const soup = new TriSoup();
+  const n = 18;
+  const rings = [0.3, 0.55, 0.75, 0.92, 1.1];
+  const vertex = (r: number, a: number): Vertex => {
+    const k = r * patchRim(p, a);
+    let x = p.x + (Math.cos(a) * p.ru * p.ax - Math.sin(a) * p.rv * p.az) * k;
+    let z = p.z + (Math.cos(a) * p.ru * p.az + Math.sin(a) * p.rv * p.ax) * k;
+    if (clip) {
+      const d = (x - clip.x) * clip.nx + (z - clip.z) * clip.nz;
+      if (d < 0) {
+        x -= d * clip.nx;
+        z -= d * clip.nz;
+      }
+    }
+    const c = site.groundTint(x, z);
+    if (r < 1) c.offsetHSL(0, 0, rng.jitter(0.015));
+    return { p: new THREE.Vector3(x, PATCH_Y, z), c };
+  };
+  const centre = vertex(0, 0);
+  const grid = rings.map((r) => Array.from({ length: n }, (_, i) => vertex(r, (i / n) * Math.PI * 2)));
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    soup.triUp(centre, grid[0][i], grid[0][j]);
+    for (let r = 0; r + 1 < rings.length; r++) {
+      soup.triUp(grid[r][i], grid[r + 1][i], grid[r + 1][j]);
+      soup.triUp(grid[r][i], grid[r + 1][j], grid[r][j]);
+    }
+  }
+  soup.addTo(b, 'mortar');
+}
+
+/** Pebbles scattered over a gravel patch. */
+function addGravel(b: PartBuilder, rng: Rng, site: Site, p: GroundPatch): void {
+  const count = Math.round(rng.range(9, 15) * site.layout.detail);
+  const stone = mix(site.palette.stone, PATH_GREY, 0.6);
+  for (let i = 0; i < count; i++) {
+    const a = rng.range(0, Math.PI * 2);
+    const r = Math.sqrt(rng.next()) * 0.8;
+    const x = p.x + (Math.cos(a) * p.ru * p.ax - Math.sin(a) * p.rv * p.az) * r;
+    const z = p.z + (Math.cos(a) * p.ru * p.az + Math.sin(a) * p.rv * p.ax) * r;
+    if (site.path.some((f) => Math.hypot(f.x - x, f.z - z) < f.hw * 0.6)) continue;
+    const s = rng.range(0.02, 0.04);
+    b.add(PEBBLE, 'stone', stoneColor(rng, stone), mat4(x, 0.004, z, rng.jitter(0.3), rng.range(0, 6), rng.jitter(0.3), s, s * rng.range(0.45, 0.7), s * rng.range(0.7, 1)));
+  }
 }
 
 /** Path frame interpolated at arc length s. */
@@ -746,6 +1018,7 @@ function frameAt(frames: PathFrame[], s: number): PathFrame {
     tz: tz / tl,
     hw: THREE.MathUtils.lerp(a.hw, b.hw, t),
     s,
+    fade: THREE.MathUtils.lerp(a.fade, b.fade, t),
   };
 }
 
@@ -768,29 +1041,29 @@ function segmentFootprint(a: PathFrame, b: PathFrame, pad: number): Footprint {
   };
 }
 
-/** Worn earth / gravel ribbon whose edges melt into the grass. */
-function addPathRibbon(b: PartBuilder, rng: Rng, frames: PathFrame[], base: THREE.Color): void {
+/**
+ * Worn earth / gravel ribbon whose edges melt into the ground beside it:
+ * the lawn, or the worn patches at the steps and the gate.
+ */
+function addPathRibbon(b: PartBuilder, rng: Rng, site: Site, frames: PathFrame[], base: THREE.Color): void {
   const soup = new TriSoup();
   const lanes = [-1, -0.55, 0, 0.55, 1];
-  const grass = new THREE.Color(PATH_EDGE);
   const phL = rng.range(0, 10);
   const phR = rng.range(0, 10);
   const rows: Vertex[][] = frames.map((f, i) => {
     const edgeL = 1 + 0.09 * Math.sin(i * 0.8 + phL) + rng.jitter(0.05);
     const edgeR = 1 + 0.09 * Math.sin(i * 0.7 + phR) + rng.jitter(0.05);
     // Towards the far end the gravel thins to a narrow, fading strip while
-    // the stones on it scatter wider: the path dissolves into the lawn.
-    const t = i / (frames.length - 1);
-    const fade = smoothstep(0.62, 1, t);
-    const thin = 1 - 0.75 * smoothstep(0.68, 1, t);
+    // the stones on it scatter wider: the path dissolves into the ground.
+    const thin = 1 - 0.75 * smoothstep(0.15, 1, f.fade);
     return lanes.map((k) => {
       const edge = Math.abs(k) === 1;
       const lat = k * f.hw * thin * (edge ? (k > 0 ? edgeL : edgeR) : 1);
       const p = beside(f, lat);
       const c = vary(base, rng, 0.035, 0.03, 0.005);
       if (k === 0) c.multiplyScalar(0.95); // the worn centre track
-      c.lerp(grass, Math.min(1, (edge ? 0.85 : Math.abs(k) > 0 ? 0.12 : 0) + fade * 0.7));
-      return { p: new THREE.Vector3(p.x, edge ? 0.004 : 0.008, p.z), c };
+      c.lerp(site.groundTint(p.x, p.z), Math.min(1, (edge ? 0.85 : Math.abs(k) > 0 ? 0.12 : 0) + f.fade * 0.7));
+      return { p: new THREE.Vector3(p.x, edge ? 0.006 : 0.009, p.z), c };
     });
   });
   for (let i = 0; i < rows.length - 1; i++) {
@@ -819,7 +1092,7 @@ function addSteppingStones(b: PartBuilder, rng: Rng, frames: PathFrame[], o: Ste
   const total = frames[frames.length - 1].s;
   let side = rng.chance(0.5) ? 1 : -1;
   for (let d = o.first; d < total - 0.15; d += rng.range(o.spacing[0], o.spacing[1])) {
-    const rx = rng.range(o.size[0], o.size[1]) * (1 - 0.25 * smoothstep(0.75, 1, d / total));
+    const rx = rng.range(o.size[0], o.size[1]) * (1 - 0.25 * smoothstep(0.3, 1, frameAt(frames, d).fade));
     const rz = rx * rng.range(0.72, 0.9);
     // However it is turned, the stone (outline up to 1.08 × rx, foot 5 % wider) stays off the steps.
     d = Math.max(d, rx * 1.15 + 0.04);
@@ -842,7 +1115,7 @@ function addFlagstones(b: PartBuilder, rng: Rng, frames: PathFrame[], stone: str
     const f = frameAt(frames, d + depth / 2);
     const hw = f.hw * 0.9;
     // Towards the far end the flags thin out, shrink and drift apart into the grass.
-    const fadeOut = smoothstep(0.6, 1, d / total);
+    const fadeOut = f.fade;
     const cells = hw * 2 > 0.95 ? rng.int(2, 3) : hw * 2 > 0.55 ? rng.int(1, 2) : 1;
     // Random cut positions across the path.
     const cuts = [-hw];
@@ -1094,7 +1367,7 @@ function buildStoopPots(site: Site, rng: Rng): PartBuilder | null {
       const wc = w + R + (k ? 0.01 : rng.range(0, 0.05));
       const fp = site.standAgainst(wall, u - R, u + R, wc - R, wc + R, potH + plantH, 0.03);
       if (!fp) break;
-      site.claim(fp, 'solid');
+      site.claim(fp, 'solid', potH + plantH);
       const m = wallMatrix(wall, u, 0, wc);
       addPot(b, rng, m, r, potH);
       addPotPlant(b, rng, mul(m, mat4(0, potH - 0.04, 0)), plant, r, plantH, flowers);
@@ -1359,7 +1632,7 @@ function addChoppingBlock(b: PartBuilder, rng: Rng, site: Site, wall: WallSpec, 
     const w = WALL_GAP + depth + 0.12 + rng.range(0.2, 0.45) + r;
     const fp = site.wallFootprint(wall, u - r - 0.37, u + r + 0.37, w - r, w + r + 0.37);
     if (!site.fits(fp, 0.04) || site.headroom(fp) < 1.2) continue;
-    site.claim(fp, 'solid');
+    site.claim(fp, 'solid', 1.1);
     const p = wallPoint(wall, u, 0, w);
     site.anchors.push({ x: p.x, z: p.z, wall });
     addBlockAndAxe(b, rng, wallMatrix(wall, u, 0, w), r, h);
@@ -2114,7 +2387,7 @@ function plantGroup(b: PartBuilder, rng: Rng, site: Site, wall: WallSpec, u: num
         cursor += 0.15;
         continue;
       }
-      site.claim(fp, 'plant');
+      site.claim(fp, 'plant', pick.h);
       const m = wallMatrix(wall, (u0 + u1) / 2, 0, w0 + pick.d / 2);
       const color = rng.chance(0.75) ? main : rng.pick(flowers);
       addBedPlant(b, rng, m, pick, color, flowers);
@@ -2371,8 +2644,9 @@ function addMound(b: PartBuilder, rng: Rng, m: THREE.Matrix4, width: number, hei
  * Little open flower (five petals around a golden eye) sitting on the
  * upper surface of a foliage blob, facing out along the surface normal.
  */
-function addFlowerOnBlob(b: PartBuilder, rng: Rng, m: THREE.Matrix4, blob: Blob, color: THREE.Color, size: number): void {
-  const d = upperDirection(rng, 0.1);
+function addFlowerOnBlob(b: PartBuilder, rng: Rng, m: THREE.Matrix4, blob: Blob, color: THREE.Color, size: number, facing = true): void {
+  // Against a wall the flowers face out (+z); free-standing plants bloom all round.
+  const d = facing ? upperDirection(rng, 0.1) : new THREE.Vector3(rng.jitter(1), rng.range(0.35, 1.2), rng.jitter(1)).normalize();
   const local = blobSurface(blob, d, 0.01);
   // Ellipsoid normal, then into world space with the blob's frame.
   const normal = new THREE.Vector3(d.x / blob.rx, d.y / blob.ry, d.z / blob.rz).normalize().transformDirection(m);
@@ -2576,7 +2850,7 @@ function placeSpikes(site: Site, beds: Beds, rng: Rng, e: WallEdge, foxglove: bo
     if (h < 1.05) continue;
     const fp = site.standAgainst(e.wall, u0, u1, w0, w0 + depth, h, 0.03, -0.04);
     if (!fp) continue;
-    site.claim(fp, 'plant');
+    site.claim(fp, 'plant', h);
     const m = wallMatrix(e.wall, (u0 + u1) / 2, 0, w0 + depth / 2);
     const c = vary(color, rng, 0.04, 0.04, 0.01);
     if (foxglove) addFoxgloves(beds.get(e.wall), rng, m, width, h, depth, c);
@@ -2632,7 +2906,7 @@ function buildClimber(site: Site, rng: Rng): PartBuilder | null {
         [off, width] = [off + 0.1, widest];
         continue;
       }
-      site.claim(fp, 'plant');
+      site.claim(fp, 'plant', h);
       const root = e.dir > 0 ? u0 + Math.min(0.18, width * 0.25) : u1 - Math.min(0.18, width * 0.25);
       const b = new PartBuilder('props:climber');
       b.explode = wallExplode(e.wall, OUTWARD.props);
@@ -2656,7 +2930,7 @@ function wrapCorner(b: PartBuilder, rng: Rng, site: Site, e: WallEdge, h: number
   if (h2 < 0.9) return;
   const fp = site.wallFootprint(next, u0 + 0.04, u1 - 0.04, WALL_GAP - 0.02, WALL_GAP + 0.1);
   if (!site.fits(fp, 0.02, 0)) return;
-  site.claim(fp, 'plant');
+  site.claim(fp, 'plant', h2);
   const root = e.dir > 0 ? u1 - 0.08 : u0 + 0.08;
   addClimberPlant(b, rng, site, next, u0, u1, root, h2, style, 1);
 }
@@ -2852,4 +3126,1081 @@ function addTuft(b: PartBuilder, rng: Rng, x: number, z: number, scale: number, 
       out.copy(root).lerp(tip, THREE.MathUtils.clamp(p.y / top, 0, 1));
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Garden: a picket fence or dry-stone wall round the front with a gate on
+// the path, a vegetable or flower bed, fruit trees and a shrub group
+// ---------------------------------------------------------------------------
+
+type FenceKind = 'picket' | 'stone';
+
+interface PlanPoint {
+  x: number;
+  z: number;
+}
+
+/**
+ * The garden plot: a fence line from one gable wall round the front of the
+ * house to the other (the house closes the loop), with a gate where the path
+ * crosses its front run.
+ */
+interface Garden {
+  kind: FenceKind;
+  /** Fence line in plan; its first and last points stand against the gable walls' plinth. */
+  pts: PlanPoint[];
+  /** Run pts[gateRun] → pts[gateRun + 1] carries the gate, its centre `gateAt` metres along the run. */
+  gateRun: number;
+  gateAt: number;
+  /** Half the clear opening between the gate posts / pillars. */
+  gateHalf: number;
+  /** Gate centre and the outward normal of its run (the way the path leaves the garden). */
+  gate: { x: number; z: number; nx: number; nz: number };
+  /** Top of the pickets / of the wall's coping. */
+  height: number;
+  /** Wall thickness at its foot (stone) or post size (picket). */
+  thick: number;
+  /** Size of the gate posts / pillars along the run. */
+  post: number;
+  /** Side with a wide side garden (-1 = -X, +1 = +X), 0 for a front garden only. */
+  wide: -1 | 0 | 1;
+}
+
+/** A straight stretch of fence: t ∈ [t0, t1] along a run from (ax, az) in direction (dx, dz). */
+interface FencePiece {
+  ax: number;
+  az: number;
+  dx: number;
+  dz: number;
+  /** Outward normal (away from the garden). */
+  nx: number;
+  nz: number;
+  t0: number;
+  t1: number;
+  /** What each end meets: the house's plinth, a corner shared with the next run, or the gate. */
+  start: 'house' | 'corner' | 'gate';
+  end: 'house' | 'corner' | 'gate';
+}
+
+/**
+ * Most houses get a garden plot: a low picket fence or (more often on stone
+ * houses) a dry-stone wall from one gable round the front to the other,
+ * 2.5–3.3 m out from the front wall, sometimes widening into a side garden.
+ */
+function planGarden(site: Site, rng: Rng, pathHalf: number): Garden | null {
+  const { layout } = site;
+  const ground = layout.storeys[0];
+  // Laid out in plan with the door facing +Z, as the layout guarantees.
+  if (site.front.normal.z < 0.99 || !rng.chance(0.82)) return null;
+  const { stoop, door } = layout;
+  const stoneOdds = ground.style === 'stone' ? 0.6 : ground.style === 'plaster' ? 0.3 : 0.15;
+  const kind: FenceKind = rng.chance(stoneOdds) ? 'stone' : 'picket';
+  const height = kind === 'picket' ? rng.range(0.8, 0.95) : rng.range(0.58, 0.72);
+  const thick = kind === 'picket' ? rng.range(0.085, 0.1) : rng.range(0.4, 0.47);
+  const post = kind === 'picket' ? thick + 0.02 : thick + rng.range(0.04, 0.1);
+  const gateHalf = THREE.MathUtils.clamp(pathHalf + 0.07, 0.42, 0.56);
+  const zFront = ground.maxZ + Math.max(rng.range(2.5, 3.3), stoop.w1 + 1.5);
+  const wide: -1 | 0 | 1 = rng.chance(0.35) ? 0 : rng.chance(0.72) ? -1 : 1;
+
+  /** One side of the plot: front corner, (knee,) back corner, foot against the gable. */
+  const side = (s: -1 | 1): PlanPoint[] | null => {
+    // In a village the neighbours close in at the front, so the front corners
+    // stay near the gables; a side garden widens out behind a slanting run.
+    const gable = site.walls.find((w) => w.side === (s < 0 ? 'left' : 'right'));
+    if (!gable) return null;
+    const xWall = s < 0 ? ground.minX : ground.maxX;
+    const front: PlanPoint = { x: xWall + s * rng.range(0.55, 1.1), z: zFront + rng.jitter(0.08) };
+    const pts: PlanPoint[] = [front];
+    let reach = Math.abs(front.x - xWall);
+    let zLo = ground.maxZ - 1.4;
+    let zHi = ground.maxZ - 0.35;
+    if (s === wide) {
+      reach = rng.range(2.1, 2.8);
+      const zKnee = ground.maxZ - rng.range(0.1, 0.6);
+      pts.push({ x: xWall + s * reach, z: zKnee });
+      zLo = Math.min(ground.minZ + 0.45, zKnee - 1.2);
+      zHi = zKnee - 0.9;
+    }
+    // Back to the gable where the fence clears its windows (and flower boxes).
+    const top = height + (kind === 'stone' ? 0.08 : 0.12);
+    for (let i = 0; i < 10; i++) {
+      const z = i === 9 ? zHi : THREE.MathUtils.lerp(zLo, zHi, rng.next());
+      const u = site.alongWall(gable, { x: xWall, z });
+      if (u < 0.3 || u > gable.length - 0.3) continue;
+      if (site.heightLimit(gable, u - post / 2 - 0.12, u + post / 2 + 0.12) < top) continue;
+      const foot = PLINTH_REACH + 0.03 + (kind === 'stone' ? 0 : post / 2);
+      pts.push({ x: xWall + s * (reach + rng.jitter(0.06)), z: z + rng.jitter(0.05) }, { x: xWall + s * foot, z });
+      return pts;
+    }
+    return null;
+  };
+  const left = side(-1);
+  const right = side(1);
+  if (!left || !right) return null;
+  const gateRun = left.length - 1;
+  const pts = [...left.reverse(), ...right];
+
+  // The gate: where the path from the door crosses the front run, a little to one side.
+  const a = pts[gateRun];
+  const b = pts[gateRun + 1];
+  const len = Math.hypot(b.x - a.x, b.z - a.z);
+  const doorX = wallPoint(site.front, (door.u0 + door.u1) / 2, 0, 0).x;
+  const margin = gateHalf + post + 0.45;
+  const gx = THREE.MathUtils.clamp(doorX + rng.jitter(0.7), a.x + margin, b.x - margin);
+  const t = (gx - a.x) / (b.x - a.x);
+  const dx = (b.x - a.x) / len;
+  const dz = (b.z - a.z) / len;
+  return {
+    kind,
+    pts,
+    gateRun,
+    gateAt: t * len,
+    gateHalf,
+    gate: { x: gx, z: a.z + (b.z - a.z) * t, nx: -dz, nz: dx },
+    height,
+    thick,
+    post,
+    wide,
+  };
+}
+
+/** The fence line cut into straight pieces, with the gate opening left out. */
+function fencePieces(g: Garden): FencePiece[] {
+  const out: FencePiece[] = [];
+  const last = g.pts.length - 2;
+  for (let i = 0; i <= last; i++) {
+    const a = g.pts[i];
+    const b = g.pts[i + 1];
+    const len = Math.hypot(b.x - a.x, b.z - a.z);
+    const dx = (b.x - a.x) / len;
+    const dz = (b.z - a.z) / len;
+    const base = { ax: a.x, az: a.z, dx, dz, nx: -dz, nz: dx };
+    const start = i === 0 ? 'house' : 'corner';
+    const end = i === last ? 'house' : 'corner';
+    if (i === g.gateRun) {
+      out.push({ ...base, t0: 0, t1: g.gateAt - g.gateHalf, start, end: 'gate' });
+      out.push({ ...base, t0: g.gateAt + g.gateHalf, t1: len, start: 'gate', end });
+    } else out.push({ ...base, t0: 0, t1: len, start, end });
+  }
+  return out;
+}
+
+/** Frame of a fence piece at t: x along the run, y up, z outward, `off` metres out from the line. */
+function pieceMatrix(pc: FencePiece, t: number, y = 0, off = 0): THREE.Matrix4 {
+  return new THREE.Matrix4()
+    .makeBasis(new THREE.Vector3(pc.dx, 0, pc.dz), UP, new THREE.Vector3(pc.nx, 0, pc.nz))
+    .setPosition(pc.ax + pc.dx * t + pc.nx * off, y, pc.az + pc.dz * t + pc.nz * off);
+}
+
+function pieceFootprint(pc: FencePiece, t0: number, t1: number, half: number): Footprint {
+  const tc = (t0 + t1) / 2;
+  return { x: pc.ax + pc.dx * tc, z: pc.az + pc.dz * tc, ax: pc.dx, az: pc.dz, hl: (t1 - t0) / 2, hw: half };
+}
+
+/** Is (x, z) inside the plot (the fence line closed through the house)? */
+function inGarden(g: Garden, x: number, z: number): boolean {
+  let inside = false;
+  const p = g.pts;
+  for (let i = 0, j = p.length - 1; i < p.length; j = i++) {
+    if (p[i].z > z !== p[j].z > z && x < ((p[j].x - p[i].x) * (z - p[i].z)) / (p[j].z - p[i].z) + p[i].x) inside = !inside;
+  }
+  return inside;
+}
+
+/** Build the fence or wall, claim its line, and return its builder (grass is sown along it later). */
+function buildFence(site: Site, rng: Rng, g: Garden): PartBuilder {
+  const b = new PartBuilder('props:fence');
+  const pieces = fencePieces(g);
+  if (g.kind === 'picket') addPicketFence(b, rng, site, g, pieces);
+  else addStoneWall(b, rng, site, g, pieces);
+  const half = g.kind === 'picket' ? 0.11 : g.thick / 2 + 0.04;
+  // Posts stand a little above the pickets; the gate posts / pillars more.
+  for (const pc of pieces) site.claim(pieceFootprint(pc, pc.t0, pc.t1, half), 'fence', g.height + 0.12);
+  for (const s of [-1, 1]) {
+    const pc = pieces.find((p) => (s < 0 ? p.end : p.start) === 'gate');
+    if (!pc) continue;
+    const t = g.gateAt + s * (g.gateHalf + g.post / 2);
+    site.claim(pieceFootprint(pc, t - g.post / 2, t + g.post / 2, half + 0.04), 'fence', g.height + 0.45);
+  }
+  b.explode = radialExplode(g.gate.x, g.gate.z);
+  return b;
+}
+
+/** Tufts of grass along the foot of the fence, sown once everything else has its place. */
+function sowFenceGrass(site: Site, b: PartBuilder, rng: Rng, g: Garden): void {
+  const step = 0.42 / Math.max(0.6, site.layout.detail);
+  const reach = g.kind === 'picket' ? 0.1 : g.thick / 2 + 0.02;
+  for (const pc of fencePieces(g)) {
+    for (let t = pc.t0 + rng.range(0, step); t < pc.t1; t += step * rng.range(0.6, 1.4)) {
+      if (!rng.chance(0.6)) continue;
+      const off = (rng.chance(0.5) ? 1 : -1) * (reach + rng.range(0, 0.1));
+      const x = pc.ax + pc.dx * t + pc.nx * off;
+      const z = pc.az + pc.dz * t + pc.nz * off;
+      if (site.grassFits(x, z)) addTuft(b, rng, x, z, rng.range(0.85, 1.25), site.wallNormalsNear(x, z));
+    }
+  }
+}
+
+// --- geometry ---------------------------------------------------------------
+
+/**
+ * Box (sx, sy, sz) centred on the origin with chamfered edges, smooth-shaded
+ * so it reads as a soft, pillowy block: 44 triangles. `jitter` nudges each
+ * corner (all three of its vertices together) for hand-cut irregularity.
+ */
+function chamferBoxGeometry(sx: number, sy: number, sz: number, chamfer: number, rng?: Rng, jitter = 0): THREE.BufferGeometry {
+  const hx = sx / 2;
+  const hy = sy / 2;
+  const hz = sz / 2;
+  const c = Math.min(chamfer, hx * 0.45, hy * 0.45, hz * 0.45);
+  const pos: number[] = [];
+  const corner = (a: number, b: number, d: number) => ((a + 1) / 2) * 4 + ((b + 1) / 2) * 2 + (d + 1) / 2;
+  for (const a of [-1, 1]) {
+    for (const b of [-1, 1]) {
+      for (const d of [-1, 1]) {
+        const jx = rng ? rng.jitter(jitter) : 0;
+        const jy = rng ? rng.jitter(jitter) : 0;
+        const jz = rng ? rng.jitter(jitter) : 0;
+        pos.push(a * hx + jx, b * (hy - c) + jy, d * (hz - c) + jz); // on the x face
+        pos.push(a * (hx - c) + jx, b * hy + jy, d * (hz - c) + jz); // on the y face
+        pos.push(a * (hx - c) + jx, b * (hy - c) + jy, d * hz + jz); // on the z face
+      }
+    }
+  }
+  const v = (a: number, b: number, d: number, face: number) => corner(a, b, d) * 3 + face;
+  const idx: number[] = [];
+  const quad = (p: number, q: number, r: number, s: number) => idx.push(p, q, r, p, r, s);
+  for (const s of [-1, 1]) {
+    quad(v(s, -1, -1, 0), v(s, 1, -1, 0), v(s, 1, 1, 0), v(s, -1, 1, 0));
+    quad(v(-1, s, -1, 1), v(1, s, -1, 1), v(1, s, 1, 1), v(-1, s, 1, 1));
+    quad(v(-1, -1, s, 2), v(1, -1, s, 2), v(1, 1, s, 2), v(-1, 1, s, 2));
+  }
+  for (const s of [-1, 1]) {
+    for (const r of [-1, 1]) {
+      quad(v(-1, s, r, 1), v(1, s, r, 1), v(1, s, r, 2), v(-1, s, r, 2)); // edges along x
+      quad(v(s, -1, r, 0), v(s, 1, r, 0), v(s, 1, r, 2), v(s, -1, r, 2)); // edges along y
+      quad(v(s, r, -1, 0), v(s, r, 1, 0), v(s, r, 1, 1), v(s, r, -1, 1)); // edges along z
+    }
+  }
+  for (let k = 0; k < 8; k++) idx.push(k * 3, k * 3 + 1, k * 3 + 2);
+  orientOutward(pos, idx, new THREE.Vector3());
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+/** Flip triangles (in place) so they all face away from `centre` (for convex shapes). */
+function orientOutward(pos: number[], idx: number[], centre: THREE.Vector3): void {
+  const a = new THREE.Vector3();
+  const b = new THREE.Vector3();
+  const c = new THREE.Vector3();
+  for (let t = 0; t < idx.length; t += 3) {
+    a.fromArray(pos, idx[t] * 3);
+    b.fromArray(pos, idx[t + 1] * 3);
+    c.fromArray(pos, idx[t + 2] * 3);
+    const n = b.clone().sub(a).cross(c.clone().sub(a));
+    const mid = a.clone().add(b).add(c).multiplyScalar(1 / 3).sub(centre);
+    if (n.dot(mid) < 0) [idx[t + 1], idx[t + 2]] = [idx[t + 2], idx[t + 1]];
+  }
+}
+
+type PicketTop = 'point' | 'round' | 'flat';
+
+/**
+ * Flat-shaded picket of width w and height h (foot centred on the origin,
+ * faces ±z, thickness t), its top pointed, rounded or with clipped corners.
+ * No bottom face. 14–22 triangles.
+ */
+function picketGeometry(w: number, h: number, t: number, top: PicketTop): THREE.BufferGeometry {
+  const o: [number, number][] = [
+    [-w / 2, 0],
+    [w / 2, 0],
+  ];
+  if (top === 'point') o.push([w / 2, h - w * 0.55], [0, h], [-w / 2, h - w * 0.55]);
+  else if (top === 'round') {
+    for (let i = 0; i <= 4; i++) {
+      const a = (i / 4) * Math.PI;
+      o.push([(Math.cos(a) * w) / 2, h - w / 2 + (Math.sin(a) * w) / 2]);
+    }
+  } else o.push([w / 2, h - 0.014], [w / 2 - 0.014, h], [-w / 2 + 0.014, h], [-w / 2, h - 0.014]);
+  const pos: number[] = [];
+  const idx: number[] = [];
+  const n = o.length;
+  // Separate vertices per face for flat shading: front, back, then a quad per side.
+  for (const z of [t / 2, -t / 2]) {
+    const base = pos.length / 3;
+    for (const [x, y] of o) pos.push(x, y, z);
+    for (let i = 1; i + 1 < n; i++) idx.push(base, base + i, base + i + 1);
+  }
+  for (let i = 1; i < n; i++) {
+    const [x0, y0] = o[i];
+    const [x1, y1] = o[(i + 1) % n];
+    const base = pos.length / 3;
+    pos.push(x0, y0, t / 2, x1, y1, t / 2, x1, y1, -t / 2, x0, y0, -t / 2);
+    idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  }
+  orientOutward(pos, idx, new THREE.Vector3(0, h * 0.45, 0));
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+// --- picket fence -------------------------------------------------------------
+
+/** Posts along a piece (t values): its ends and evenly spaced ones between, at most `bay` apart. */
+function postStations(rng: Rng, t0: number, t1: number, bay: number): number[] {
+  const n = Math.max(1, Math.ceil((t1 - t0) / bay));
+  const out = [t0];
+  for (let i = 1; i < n; i++) out.push(t0 + ((t1 - t0) * i) / n + rng.jitter(0.06));
+  out.push(t1);
+  return out;
+}
+
+/**
+ * Low picket fence: posts with little pyramid caps, two rails, pickets on
+ * the outside (pointed, round or clipped; level, dipping or arching between
+ * the posts), painted or weathered, slightly irregular; a picket gate on
+ * strap hinges, often left ajar.
+ */
+function addPicketFence(b: PartBuilder, rng: Rng, site: Site, g: Garden, pieces: FencePiece[]): void {
+  const pal = site.palette;
+  const k = 1 / Math.sqrt(Math.max(0.6, site.layout.detail));
+  const paint = rng.weighted([
+    ['white', 4],
+    ['shutter', 2],
+    ['natural', 3],
+  ] as const);
+  const base =
+    paint === 'white' ? mix(pal.trim, '#d6ccb8', 0.35) : paint === 'shutter' ? mix(pal.shutter, WEATHERED, 0.22) : mix(pal.wood, WEATHERED, 0.62);
+  const postBase = paint === 'natural' ? mix(pal.timber, WEATHERED, 0.5) : base.clone().multiplyScalar(0.96);
+  const H = g.height;
+  const P = g.post;
+  const pw = rng.range(0.07, 0.085);
+  // Rough-sawn pickets stand a little further apart than painted ones.
+  const pitch = (pw + rng.range(0.045, 0.06) + (paint === 'natural' ? 0.035 : 0)) * k;
+  const pt = 0.022;
+  const top = rng.weighted<PicketTop>([
+    ['point', 3],
+    ['round', 2],
+    ['flat', 1],
+  ]);
+  const curve = rng.weighted([
+    ['level', 4],
+    ['dip', 1],
+    ['arch', 1],
+  ] as const);
+  const picket = picketGeometry(pw, H, pt, top);
+  const railH = 0.065;
+  const railT = 0.032;
+  const railYs = [0.2, H - 0.24];
+  const railOff = P / 2 - railT / 2;
+  const picketOff = P / 2 + pt / 2 + 0.003;
+  const postH = H + 0.07;
+
+  const addPost = (pc: FencePiece, t: number, gate: boolean) => {
+    const h = postH + (gate ? 0.1 : 0) + rng.jitter(0.015);
+    const s = P + (gate ? 0.02 : 0);
+    const m = mul(pieceMatrix(pc, t), mat4(0, 0, 0, rng.jitter(0.025), rng.jitter(0.04), rng.jitter(0.025)));
+    const c = vary(postBase, rng, 0.035, 0.03, 0.006);
+    b.add(chamferBoxGeometry(s, h + 0.04, s, 0.014), 'wood', c, mul(m, mat4(0, (h - 0.04) / 2, 0)));
+    b.add(new THREE.ConeGeometry(s * 0.74, 0.055, 4, 1), 'wood', c, mul(m, mat4(0, h + 0.027, 0, 0, Math.PI / 4, 0)));
+    if (gate && rng.chance(0.5)) b.add(new THREE.IcosahedronGeometry(s * 0.32, 1), 'wood', c, mul(m, mat4(0, h + 0.07, 0)));
+  };
+
+  for (const pc of pieces) {
+    const stations = postStations(rng, pc.t0, pc.t1, 1.85 * Math.min(1.15, k));
+    // Posts at the ends a gate or the house needs; a corner post belongs to the piece ending there.
+    const gateStart = pc.start === 'gate';
+    const gateEnd = pc.end === 'gate';
+    const tStart = pc.t0 + (gateStart ? P / 2 + 0.01 : 0);
+    const tEnd = pc.t1 - (gateEnd ? P / 2 + 0.01 : 0);
+    stations[0] = tStart;
+    stations[stations.length - 1] = tEnd;
+    stations.forEach((t, i) => {
+      if (i === 0 && pc.start === 'corner') return;
+      addPost(pc, t, (i === 0 && gateStart) || (i === stations.length - 1 && gateEnd));
+    });
+    for (let i = 0; i + 1 < stations.length; i++) {
+      const ta = stations[i];
+      const tb = stations[i + 1];
+      // Two rails on the outer half of the posts.
+      for (const ry of railYs) {
+        const c = vary(base, rng, 0.03, 0.03, 0.005).multiplyScalar(0.93);
+        const m = mul(pieceMatrix(pc, (ta + tb) / 2, ry + rng.jitter(0.01), railOff), mat4(0, 0, 0, 0, 0, rng.jitter(0.012)));
+        b.add(chamferBoxGeometry(tb - ta + P * 0.4, railH, railT, 0.01), 'wood', c, m);
+      }
+      // Pickets between the posts.
+      const span0 = ta + P / 2 + 0.018;
+      const span1 = tb - P / 2 - 0.018;
+      const count = Math.max(1, Math.round((span1 - span0) / pitch));
+      const step = (span1 - span0) / count;
+      for (let j = 0; j < count; j++) {
+        const f = (j + 0.5) / count;
+        const t = span0 + step * (j + 0.5) + rng.jitter(0.006);
+        let h = 1 + rng.jitter(0.016);
+        if (curve === 'dip') h -= (0.075 * Math.sin(Math.PI * f)) / H;
+        else if (curve === 'arch') h -= (0.075 * (1 - Math.sin(Math.PI * f))) / H;
+        const m = mul(pieceMatrix(pc, t, 0.035, picketOff), mat4(0, 0, 0, rng.jitter(0.02), rng.jitter(0.03), rng.jitter(0.025), 1, h, 1));
+        b.add(picket, 'wood', vary(base, rng, 0.04, 0.03, 0.006), m);
+      }
+    }
+  }
+  addGate(b, rng, site, g, pieces, { kind: 'picket', color: base, picket, pitch, railH, railT, picketOff: railT / 2 + pt / 2 + 0.003 });
+}
+
+interface GateStyle {
+  kind: 'picket' | 'bars';
+  color: THREE.Color;
+  picket: THREE.BufferGeometry | null;
+  pitch: number;
+  railH: number;
+  railT: number;
+  picketOff: number;
+}
+
+/**
+ * Gate leaf between the gate posts (or pillars): rails and a diagonal brace,
+ * pickets (or plain bars), strap hinges and a ring latch; closed or swung
+ * open into the garden. Its footprint is claimed so nothing grows through it.
+ */
+function addGate(b: PartBuilder, rng: Rng, site: Site, g: Garden, pieces: FencePiece[], st: GateStyle): void {
+  const pc = pieces.find((p) => p.end === 'gate');
+  if (!pc) return;
+  const hs = rng.chance(0.5) ? 1 : -1; // hinge on the far (+1) or near (-1) side along the run
+  const width = 2 * g.gateHalf - 0.03;
+  const H = st.kind === 'picket' ? g.height - 0.02 : g.height + 0.04;
+  const open = rng.chance(0.62) ? rng.range(0.3, 0.95) : rng.range(0, 0.05);
+  const hingeT = g.gateAt + hs * g.gateHalf;
+  const hinge = new THREE.Vector3(pc.ax + pc.dx * hingeT, 0, pc.az + pc.dz * hingeT);
+  const along = new THREE.Vector3(pc.dx, 0, pc.dz).multiplyScalar(-hs);
+  const inward = new THREE.Vector3(-pc.nx, 0, -pc.nz);
+  const e = along.clone().multiplyScalar(Math.cos(open)).addScaledVector(inward, Math.sin(open));
+  const z = e.clone().cross(UP);
+  const m = new THREE.Matrix4().makeBasis(e, UP, z).setPosition(hinge.x + e.x * 0.015, 0, hinge.z + e.z * 0.015);
+  const at = (x: number, y: number, zz: number, rz = 0) => mul(m, mat4(x, y, zz, 0, 0, rz));
+  // The pickets face out of the garden when the gate is shut: z = cross(along, up) = -hs · outward.
+  const out = -hs;
+  const wood = st.color;
+  const y0 = 0.2;
+  const y1 = H - 0.24;
+  for (const y of [y0, y1]) b.add(chamferBoxGeometry(width - 0.02, st.railH, st.railT, 0.01), 'wood', vary(wood, rng, 0.03, 0.03, 0.005), at(width / 2, y, 0));
+  // Brace from the bottom of the hinge side up to the top of the latch side.
+  const bx0 = 0.07;
+  const bx1 = width - 0.07;
+  const blen = Math.hypot(bx1 - bx0, y1 - y0 - st.railH);
+  const bang = Math.atan2(y1 - y0 - st.railH, bx1 - bx0);
+  b.add(chamferBoxGeometry(blen, 0.06, st.railT * 0.9, 0.01), 'wood', vary(wood, rng, 0.03, 0.03, 0.005), at((bx0 + bx1) / 2, (y0 + y1) / 2, 0, bang));
+  if (st.kind === 'picket' && st.picket) {
+    const count = Math.max(3, Math.round((width - 0.05) / st.pitch));
+    for (let j = 0; j < count; j++) {
+      const x = 0.025 + ((width - 0.05) * (j + 0.5)) / count;
+      const h = (H / g.height) * (1 + rng.jitter(0.012));
+      b.add(st.picket, 'wood', vary(wood, rng, 0.04, 0.03, 0.006), mul(at(x, 0.06, out * st.picketOff), mat4(0, 0, 0, 0, 0, 0, 1, h, 1)));
+    }
+  } else {
+    // Bars: a top rail and two more between the rails, and stiles at both ends.
+    for (const y of [(y0 + y1) / 2, H - 0.05]) b.add(chamferBoxGeometry(width - 0.02, 0.06, st.railT, 0.01), 'wood', vary(wood, rng, 0.03, 0.03, 0.005), at(width / 2, y, 0));
+    for (const x of [0.035, width - 0.035]) b.add(chamferBoxGeometry(0.06, H - 0.04, st.railT * 1.15, 0.012), 'wood', vary(wood, rng, 0.03, 0.03, 0.005), at(x, 0.06 + (H - 0.04) / 2, 0));
+  }
+  // Strap hinges and a ring latch.
+  const iron = vary(IRON, rng, 0.03, 0.02, 0);
+  const strapZ = out * (st.railT / 2 + (st.kind === 'picket' ? 0.025 : 0.006));
+  for (const y of [y0, y1]) b.add(chamferBoxGeometry(width * 0.4, 0.03, 0.008, 0.003), 'metal', iron, at(width * 0.2, y, strapZ));
+  b.add(new THREE.TorusGeometry(0.028, 0.006, 4, 10), 'metal', iron, at(width - 0.06, (y0 + y1) / 2 + 0.06, strapZ * 1.4));
+  // Nothing grows where the leaf stands (it is over the path when open, beside it when shut).
+  site.claim(
+    { x: hinge.x + e.x * (width / 2), z: hinge.z + e.z * (width / 2), ax: e.x, az: e.z, hl: width / 2, hw: 0.06 },
+    'solid',
+    H + 0.1,
+  );
+}
+
+// --- dry-stone wall -----------------------------------------------------------
+
+/**
+ * Dry-stone wall: courses of soft, chunky field stones running through the
+ * wall (battered, narrower at the top), a dark core showing in the gaps,
+ * coping stones on edge or flat cap slabs; square pillars at the gate with
+ * a wooden gate (or just the opening).
+ */
+function addStoneWall(b: PartBuilder, rng: Rng, site: Site, g: Garden, pieces: FencePiece[]): void {
+  const pal = site.palette;
+  // Bigger stones on big houses and long walls keep the wall near ~8k triangles.
+  const total = pieces.reduce((n, pc) => n + pc.t1 - pc.t0, 0);
+  const k = THREE.MathUtils.clamp(total / 18, 1, 1.3) / Math.sqrt(Math.max(0.55, site.layout.detail));
+  const stone = mix(pal.stone, PATH_GREY, 0.4).multiplyScalar(0.92);
+  const T = g.thick;
+  const H = g.height;
+  const coping = rng.chance(0.7);
+  const capH = coping ? rng.range(0.15, 0.19) : rng.range(0.075, 0.095);
+  const bodyH = H - capH + (coping ? 0.02 : 0);
+  const courses = bodyH > 0.5 ? 3 : 2;
+  const thickAt = (y: number) => T * (1 - (0.2 * y) / H);
+  const core = mix(pal.mortar, '#4a4238', 0.45);
+
+  for (const pc of pieces) {
+    // The run that ends at a corner covers it; the next one starts behind it.
+    const t0 = pc.t0 + (pc.start === 'corner' ? T / 2 : 0) + (pc.start === 'gate' ? g.post - 0.02 : 0);
+    const t1 = pc.t1 + (pc.end === 'corner' ? T / 2 : 0) - (pc.end === 'gate' ? g.post - 0.02 : 0);
+    if (t1 - t0 < 0.1) continue;
+    const len = t1 - t0;
+    b.box('mortar', core, len - 0.04, bodyH - 0.06, T * 0.84, pieceMatrix(pc, (t0 + t1) / 2, (bodyH - 0.06) / 2));
+    let y = -0.03;
+    for (let c = 0; c < courses; c++) {
+      const hc = (bodyH + 0.03) / courses;
+      const Tk = thickAt(y + hc / 2);
+      let t = t0;
+      // Stagger the joints course to course.
+      let first = c % 2 ? rng.range(0.14, 0.28) : rng.range(0.3, 0.5);
+      while (t < t1 - 0.02) {
+        let l = first > 0 ? first : rng.range(0.32, 0.56) * k;
+        first = 0;
+        if (t1 - (t + l) < 0.16) l = t1 - t;
+        // Field stones packed tight: no two alike, some a little proud of the face.
+        const sy = hc * rng.range(0.96, 1.1);
+        const sz = Tk * rng.range(0.97, 1.07);
+        const m = mul(pieceMatrix(pc, t + l / 2, y + hc / 2 + rng.jitter(0.012), rng.jitter(0.015)), mat4(0, 0, 0, rng.jitter(0.03), rng.jitter(0.04), rng.jitter(0.05)));
+        b.add(chamferBoxGeometry(l - 0.014, sy, sz, Math.min(0.05, sy * 0.3, l * 0.25), rng, 0.016), 'stone', stoneColor(rng, stone).offsetHSL(0, 0, rng.jitter(0.03)), m);
+        t += l;
+      }
+      y += hc;
+    }
+    // Coping: stones on edge, leaning a little this way and that; or flat slabs.
+    const Ttop = thickAt(bodyH);
+    let t = t0;
+    while (t < t1 - 0.03) {
+      let l = coping ? rng.range(0.16, 0.26) * k : rng.range(0.5, 0.75) * k;
+      if (t1 - (t + l) < (coping ? 0.08 : 0.2)) l = t1 - t;
+      const lean = coping ? rng.jitter(0.12) : rng.jitter(0.02);
+      const sy = capH * (coping ? rng.range(0.85, 1.1) : rng.range(0.9, 1.1));
+      const sz = coping ? Ttop * rng.range(0.92, 1.05) : Ttop + rng.range(0.05, 0.1);
+      const m = mul(pieceMatrix(pc, t + l / 2, bodyH - (coping ? 0.02 : 0) + sy / 2, rng.jitter(0.01)), mat4(0, 0, 0, rng.jitter(0.03), rng.jitter(0.04), lean));
+      b.add(chamferBoxGeometry(l - 0.012, sy, sz, Math.min(0.035, l * 0.25), rng, 0.01), 'stone', stoneColor(rng, stone).multiplyScalar(1.03), m);
+      t += l;
+    }
+  }
+  // Pillars either side of the gate.
+  const gp = pieces.find((p) => p.end === 'gate');
+  if (!gp) return;
+  const pillarH = H + rng.range(0.2, 0.3);
+  const ball = rng.chance(0.35);
+  for (const s of [-1, 1]) {
+    const t = g.gateAt + s * (g.gateHalf + g.post / 2);
+    const rows = 3;
+    const rh = (pillarH - 0.09) / rows;
+    for (let r = 0; r < rows; r++) {
+      const m = mul(pieceMatrix(gp, t, -0.02 + rh * (r + 0.5), 0), mat4(0, 0, 0, rng.jitter(0.02), rng.jitter(0.05), rng.jitter(0.02)));
+      b.add(chamferBoxGeometry(g.post * rng.range(0.98, 1.04), rh + 0.01, T + 0.06, 0.045, rng, 0.012), 'stone', stoneColor(rng, stone), m);
+    }
+    const cm = mul(pieceMatrix(gp, t, pillarH - 0.06, 0), mat4(0, 0, 0, 0, rng.jitter(0.04), 0));
+    b.add(chamferBoxGeometry(g.post + 0.08, 0.09, T + 0.14, 0.03, rng, 0.008), 'stone', stoneColor(rng, stone).multiplyScalar(1.05), cm);
+    if (ball) b.add(blobGeometry(1, rng.int(0, BLOB_VARIANTS - 1)), 'stone', stoneColor(rng, stone), mul(cm, mat4(0, 0.13, 0, 0, 0, 0, 0.11, 0.1, 0.11)));
+  }
+  if (rng.chance(0.75)) {
+    const wood = rng.chance(0.5) ? mix(pal.wood, WEATHERED, 0.4) : mix(pal.shutter, WEATHERED, 0.3);
+    addGate(b, rng, site, g, pieces, { kind: 'bars', color: wood, picket: null, pitch: 0, railH: 0.07, railT: 0.04, picketOff: 0 });
+  }
+}
+
+// --- beds ---------------------------------------------------------------------
+
+type VegKind = 'cabbage' | 'lettuce' | 'leek' | 'carrot';
+
+/** Where a bed could go: in the front garden beside the path, or in the side garden. */
+function bedCandidates(site: Site, rng: Rng, g: Garden, len: number, depth: number): Footprint[] {
+  const ground = site.layout.storeys[0];
+  const { bounds } = site.layout;
+  const out: Footprint[] = [];
+  const a = g.pts[g.gateRun];
+  const b = g.pts[g.gateRun + 1];
+  // Out from under the eaves (sun and rain), clear of the fence.
+  const zIn = Math.max(bounds.max.z, ground.maxZ + 0.9) + 0.25 + depth / 2;
+  const zOut = Math.min(a.z, b.z) - 0.42 - depth / 2;
+  const sideFirst = g.wide !== 0 && rng.chance(0.35);
+  const front: Footprint[] = [];
+  const side: Footprint[] = [];
+  for (let i = 0; i < 24 && zOut >= zIn; i++) {
+    const x = THREE.MathUtils.lerp(a.x + 0.5 + len / 2, b.x - 0.5 - len / 2, rng.next());
+    const r = rng.jitter(0.05);
+    front.push({ x, z: THREE.MathUtils.lerp(zIn, zOut, rng.next()), ax: Math.cos(r), az: Math.sin(r), hl: len / 2, hw: depth / 2 });
+  }
+  if (g.wide !== 0) {
+    const s = g.wide;
+    const xWall = s < 0 ? ground.minX : ground.maxX;
+    const eave = s < 0 ? xWall - bounds.min.x : bounds.max.x - xWall;
+    for (let i = 0; i < 24; i++) {
+      const off = THREE.MathUtils.lerp(eave + 0.3 + depth / 2, 2.8 - depth / 2, rng.next());
+      const r = Math.PI / 2 + rng.jitter(0.05);
+      side.push({ x: xWall + s * off, z: THREE.MathUtils.lerp(ground.minZ, ground.maxZ, rng.next()), ax: Math.cos(r), az: Math.sin(r), hl: len / 2, hw: depth / 2 });
+    }
+  }
+  out.push(...(sideFirst ? [...side, ...front] : [...front, ...side]));
+  return out;
+}
+
+/** Corners of a footprint. */
+function corners(fp: Footprint): PlanPoint[] {
+  const px = -fp.az;
+  const pz = fp.ax;
+  return [
+    [1, 1],
+    [1, -1],
+    [-1, -1],
+    [-1, 1],
+  ].map(([a, c]) => ({ x: fp.x + fp.ax * fp.hl * a + px * fp.hw * c, z: fp.z + fp.az * fp.hl * a + pz * fp.hw * c }));
+}
+
+/**
+ * A kitchen-garden bed inside the plot: rows of cabbages, lettuces, leeks
+ * and carrots (sometimes a pumpkin) on ridged dark soil, or rows of cut
+ * flowers; often edged with boards.
+ */
+function buildGardenBed(site: Site, rng: Rng, g: Garden): PartBuilder | null {
+  if (!rng.chance(0.85)) return null;
+  const veg = rng.chance(0.65);
+  const edged = rng.chance(0.6);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const len = rng.range(1.5, 2.5) * (1 - attempt * 0.18);
+    const depth = rng.range(0.85, 1.15) * (1 - attempt * 0.12);
+    for (const fp of bedCandidates(site, rng, g, len, depth)) {
+      if (!corners(fp).every((c) => inGarden(g, c.x, c.z))) continue;
+      if (!site.fits(fp, 0.3, 0.12) || site.headroom(fp) < 2) continue;
+      site.claim(fp, 'solid', 0.5);
+      const b = new PartBuilder('props:garden-bed');
+      b.explode = radialExplode(fp.x, fp.z);
+      // Local x along the bed, z across it.
+      const m = planMatrix(fp.x, fp.z, -fp.az, fp.ax);
+      if (veg) addVegBed(b, rng, site, m, fp.hl * 2, fp.hw * 2, edged);
+      else addFlowerRows(b, rng, site, m, fp.hl * 2, fp.hw * 2, edged);
+      for (const c of corners(fp)) site.anchors.push({ x: c.x + (c.x - fp.x) * 0.08, z: c.z + (c.z - fp.z) * 0.08, wall: null });
+      return b;
+    }
+  }
+  return null;
+}
+
+/** Soil (and edging) of a bed of length L and width W in the frame `m`; returns the soil's top height. */
+function addBedSoil(b: PartBuilder, rng: Rng, site: Site, m: THREE.Matrix4, L: number, W: number, edged: boolean, rows: number): number {
+  const soil = vary(SOIL, rng, 0.03, 0.03, 0.005).multiplyScalar(0.85);
+  const top = edged ? 0.1 : 0.06;
+  if (edged) {
+    const board = mix(site.palette.wood, WEATHERED, 0.45);
+    for (const s of [-1, 1]) {
+      b.add(chamferBoxGeometry(L, 0.15, 0.045, 0.012), 'wood', vary(board, rng, 0.05, 0.03, 0.008), mul(m, mat4(0, 0.055, s * (W / 2 - 0.0225), 0, rng.jitter(0.01), rng.jitter(0.01))));
+      b.add(chamferBoxGeometry(0.045, 0.15, W - 0.09, 0.012), 'wood', vary(board, rng, 0.05, 0.03, 0.008), mul(m, mat4(s * (L / 2 - 0.0225), 0.055, 0)));
+    }
+  }
+  const inset = edged ? 0.09 : 0;
+  b.add(chamferBoxGeometry(L - inset, top + 0.04, W - inset, edged ? 0.02 : 0.05), 'mortar', soil, mul(m, mat4(0, (top + 0.04) / 2 - 0.04, 0)));
+  // A ridge of earthed-up soil along each row.
+  const rw = (W - inset - 0.08) / rows;
+  for (let r = 0; r < rows; r++) {
+    const z = -(W - inset - 0.08) / 2 + rw * (r + 0.5);
+    b.add(chamferBoxGeometry(L - inset - 0.14, 0.07, rw * 0.62, 0.03, rng, 0.006), 'mortar', vary(soil, rng, 0.03, 0.02, 0).multiplyScalar(1.08), mul(m, mat4(0, top - 0.01, z)));
+  }
+  return top + 0.02;
+}
+
+/** Rows of vegetables: a crop per row, with a pumpkin rambling off one end now and then. */
+function addVegBed(b: PartBuilder, rng: Rng, site: Site, m: THREE.Matrix4, L: number, W: number, edged: boolean): void {
+  const rows = W > 0.95 ? 3 : 2;
+  const top = addBedSoil(b, rng, site, m, L, W, edged, rows);
+  const inset = edged ? 0.09 : 0;
+  const rw = (W - inset - 0.08) / rows;
+  const detail = site.layout.detail;
+  const kinds: VegKind[] = ['cabbage', 'lettuce', 'leek', 'carrot'];
+  let prev: VegKind | null = null;
+  const pumpkin = rng.chance(0.3);
+  for (let r = 0; r < rows; r++) {
+    const kind = rng.pick(kinds.filter((x) => x !== prev));
+    prev = kind;
+    const z = -(W - inset - 0.08) / 2 + rw * (r + 0.5);
+    const spacing = (kind === 'cabbage' ? 0.34 : kind === 'lettuce' ? 0.27 : 0.17) / Math.sqrt(Math.max(0.6, detail));
+    const end = L / 2 - inset / 2 - 0.12 - (pumpkin && r === 0 ? 0.42 : 0);
+    const n = Math.max(2, Math.floor((end + L / 2 - inset / 2 - 0.12) / spacing));
+    const start = -L / 2 + inset / 2 + 0.12;
+    const step = (end - start) / n;
+    for (let i = 0; i < n; i++) {
+      if (rng.chance(0.05)) continue; // one already harvested
+      const x = start + step * (i + 0.5) + rng.jitter(0.02);
+      const pm = mul(m, mat4(x, top, z + rng.jitter(0.02), 0, rng.range(0, Math.PI * 2), 0));
+      addVeg(b, rng, pm, kind, Math.min(rw, spacing) * 0.5);
+    }
+    if (pumpkin && r === 0) addPumpkin(b, rng, mul(m, mat4(end + 0.25, top, z, 0, rng.range(0, 6), 0)));
+  }
+}
+
+const VEG_LEAVES: Record<VegKind, string[]> = {
+  cabbage: ['#7d9e78', '#6f9670', '#86a77c'],
+  lettuce: ['#9cc35e', '#8fbb55', '#a8c96a'],
+  leek: ['#6e9a70', '#78a275'],
+  carrot: ['#77ab44', '#6ea23f'],
+};
+
+/** One vegetable of radius ~r at the origin of `m` (on the soil). */
+function addVeg(b: PartBuilder, rng: Rng, m: THREE.Matrix4, kind: VegKind, r: number): void {
+  const leaf = vary(rng.pick(VEG_LEAVES[kind]), rng, 0.04, 0.04, 0.008);
+  if (kind === 'cabbage' || kind === 'lettuce') {
+    const cab = kind === 'cabbage';
+    const s = r * (cab ? rng.range(0.95, 1.1) : rng.range(0.85, 1));
+    if (cab) b.add(blobGeometry(1, rng.int(0, BLOB_VARIANTS - 1)), 'foliage', leaf.clone().offsetHSL(0, -0.03, 0.06), mul(m, mat4(0, s * 0.5, 0, 0, 0, 0, s * 0.68, s * 0.6, s * 0.68)), shade(0.92));
+    else b.add(PEBBLE, 'foliage', leaf.clone().offsetHSL(0, 0, 0.05), mul(m, mat4(0, s * 0.38, 0, 0, 0, 0, s * 0.4, s * 0.34, s * 0.4)));
+    const n = cab ? 5 : 7;
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2 + rng.jitter(0.3);
+      const tilt = cab ? rng.range(0.55, 0.85) : rng.range(0.35, 0.65); // from vertical
+      const nrm = new THREE.Vector3(Math.cos(a) * Math.sin(tilt), Math.cos(tilt), Math.sin(a) * Math.sin(tilt));
+      const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), nrm);
+      const ls = s * (cab ? 0.72 : 0.62) * rng.range(0.85, 1.1);
+      const p = new THREE.Vector3(Math.cos(a) * s * 0.5, s * (cab ? 0.25 : 0.32), Math.sin(a) * s * 0.5);
+      const lm = mul(m, new THREE.Matrix4().compose(p, q, new THREE.Vector3(ls, ls * 0.85, ls * 0.3)));
+      b.add(CLIMB_LEAF, 'foliage', vary(leaf, rng, 0.04, 0.03, 0.006).multiplyScalar(cab ? 0.88 : 1), lm);
+    }
+    return;
+  }
+  // Leeks stand up straight and blue-green; carrot tops are a feathery, brighter fan.
+  const leek = kind === 'leek';
+  const n = leek ? rng.int(4, 6) : rng.int(6, 8);
+  const h = leek ? rng.range(0.24, 0.32) : rng.range(0.13, 0.19);
+  for (let i = 0; i < n; i++) {
+    const a = rng.range(0, Math.PI * 2);
+    const tilt = leek ? rng.range(0.05, 0.3) : rng.range(0.25, 0.6);
+    const w = leek ? 0.018 : 0.012;
+    b.add(GRASS_BLADE, 'foliage', vary(leaf, rng, 0.04, 0.03, 0.006), mul(m, mat4(0, 0, 0, 0, a, tilt, w, h * rng.range(0.8, 1.1), w)));
+  }
+  if (leek) b.add(new THREE.CylinderGeometry(0.018, 0.02, 0.07, 6, 1, true), 'foliage', '#dfe2c4', mul(m, mat4(0, 0.03, 0)));
+  else if (rng.chance(0.4)) b.add(PEBBLE, 'flower', vary('#e07a2c', rng, 0.04, 0.04, 0.01), mul(m, mat4(0, 0.005, 0, 0, 0, 0, 0.022, 0.018, 0.022)));
+}
+
+/** A ribbed orange pumpkin with a stalk and a couple of big leaves. */
+function addPumpkin(b: PartBuilder, rng: Rng, m: THREE.Matrix4): void {
+  const r = rng.range(0.13, 0.17);
+  const orange = vary(rng.pick(['#df8a2f', '#d9772a', '#e39a3a']), rng, 0.04, 0.04, 0.01);
+  const ribs = 8;
+  const pts: THREE.Vector2[] = [];
+  for (let i = 0; i <= 8; i++) {
+    const a = -Math.PI / 2 + (i / 8) * Math.PI;
+    pts.push(new THREE.Vector2(Math.max(0.001, Math.cos(a) * r), (Math.sin(a) + 1) * r * 0.72));
+  }
+  const g = new THREE.LatheGeometry(pts, ribs * 2);
+  // Ribs: pull every other column in.
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    const z = pos.getZ(i);
+    const a = Math.atan2(z, x);
+    const k = 1 - 0.07 * (0.5 + 0.5 * Math.cos(a * ribs));
+    pos.setXYZ(i, x * k, pos.getY(i), z * k);
+  }
+  g.computeVertexNormals();
+  b.add(g, 'flower', orange, m, (_p, n, out) => out.multiplyScalar(0.78 + 0.25 * Math.max(0, n.y)));
+  b.add(new THREE.CylinderGeometry(0.012, 0.018, 0.06, 5), 'wood', '#6b6a3a', mul(m, mat4(0, r * 1.44 + 0.02, 0, 0.2, 0, 0.1)));
+  const leaf = vary('#5f8f45', rng, 0.04, 0.04, 0.01);
+  for (let i = 0; i < 2; i++) {
+    const a = rng.range(0, Math.PI * 2);
+    const nrm = new THREE.Vector3(Math.cos(a) * 0.4, 1, Math.sin(a) * 0.4).normalize();
+    const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), nrm);
+    const lm = mul(m, new THREE.Matrix4().compose(new THREE.Vector3(Math.cos(a) * r * 1.3, 0.04, Math.sin(a) * r * 1.3), q, new THREE.Vector3(0.13, 0.11, 0.04)));
+    b.add(CLIMB_LEAF, 'foliage', leaf, lm);
+  }
+}
+
+/**
+ * Rows of cut flowers: a colour per row, each row a line of small leafy
+ * clumps nestled together and crowned with blooms.
+ */
+function addFlowerRows(b: PartBuilder, rng: Rng, site: Site, m: THREE.Matrix4, L: number, W: number, edged: boolean): void {
+  const rows = W > 1.0 ? 3 : 2;
+  const top = addBedSoil(b, rng, site, m, L, W, edged, rows);
+  const inset = edged ? 0.09 : 0;
+  const rw = (W - inset - 0.08) / rows;
+  const palette = [...flowerColors(site.palette), ...HOLLYHOCK_COLORS.map((c) => new THREE.Color(c))];
+  const detail = site.layout.detail;
+  let prev = -1;
+  for (let r = 0; r < rows; r++) {
+    let ci = rng.int(0, palette.length - 1);
+    if (ci === prev) ci = (ci + 1) % palette.length;
+    prev = ci;
+    const color = palette[ci];
+    const z = -(W - inset - 0.08) / 2 + rw * (r + 0.5);
+    const len = L - inset - 0.16;
+    const h = rng.range(0.17, 0.25);
+    const leaf = vary(rng.pick(LEAVES), rng, 0.04, 0.04, 0.01);
+    // About 16 clumps in the bed at most (each is ~230 triangles).
+    const n = Math.max(3, Math.min(Math.floor(16 / rows), Math.round(len / (0.3 / Math.sqrt(Math.max(0.6, detail))))));
+    const step = len / n;
+    for (let i = 0; i < n; i++) {
+      const x = -len / 2 + step * (i + 0.5) + rng.jitter(0.03);
+      const hh = h * rng.range(0.85, 1.12);
+      // Small clumps with soil showing between them, so the rows read as rows.
+      const r = Math.min(step * 0.46, rw * 0.36);
+      const blob: Blob = { x, y: top + hh * 0.38, z: z + rng.jitter(0.02), rx: r, ry: hh * 0.62, rz: r * 0.92, v: 0 };
+      blob.v = addShrubBlob(b, rng, m, blob.x, blob.y, blob.z, blob.rx, blob.ry, blob.rz, vary(leaf, rng, 0.03, 0.03, 0.005), 1, top + hh);
+      const blooms = rng.int(5, 7);
+      for (let k = 0; k < blooms; k++) addFlowerOnBlob(b, rng, m, blob, vary(color, rng, 0.04, 0.03, 0.006), 0.036, false);
+    }
+  }
+}
+
+// --- trees and shrubs ----------------------------------------------------------
+
+/** A small smooth ball (40 triangles): apples, plums. */
+const FRUIT_BALL = new THREE.SphereGeometry(1, 6, 5);
+
+/** Fruit colours: red apples, yellow apples / pears, or plums. */
+const FRUIT = [
+  ['#c0392b', '#b5352a', '#cf4a30'],
+  ['#d8b23c', '#cfae3a', '#c9b745'],
+  ['#c0392b', '#d8b23c', '#cf6a30'],
+  ['#7b3f6e', '#6c3763'],
+];
+
+/**
+ * Most houses get a fruit tree (sometimes two), off to the -X side or behind
+ * the house so it never hides the door from the default view; gardens also
+ * get a shrub group in a corner now and then.
+ */
+function buildTrees(site: Site, rng: Rng, g: Garden | null): PartBuilder[] {
+  const out: PartBuilder[] = [];
+  const count = rng.weighted([
+    [0, 1.2],
+    [1, 6],
+    [2, 2.5],
+  ] as const);
+  for (let i = 0; i < count; i++) {
+    const R = i === 0 ? rng.range(1.05, 1.45) : rng.range(0.85, 1.1);
+    const tree: TreeShape = { R, trunkH: rng.range(1.45, 1.75), lean: rng.range(0.04, 0.1) };
+    const spot = treeSpot(site, rng, tree, i === 0 ? 'side' : 'back');
+    if (!spot) continue;
+    const b = new PartBuilder(`props:tree${i}`);
+    b.explode = radialExplode(spot.x, spot.z);
+    addFruitTree(b, rng, site, spot.x, spot.z, tree);
+    out.push(b);
+  }
+  if (g && (rng.chance(0.45) || !out.length)) {
+    const shrubs = buildShrubGroup(site, rng, g);
+    if (shrubs) out.push(shrubs);
+  }
+  return out;
+}
+
+/** Proportions of a fruit tree: crown radius, trunk height up to the fork, lean (rad). */
+interface TreeShape {
+  R: number;
+  trunkH: number;
+  lean: number;
+}
+
+/** Underside of the crown (lowest blob or fruit) above the ground. */
+function crownBottom(t: TreeShape): number {
+  return 1.05 * t.trunkH - 0.11 - 0.31 * t.R;
+}
+
+/** Plan footprint of the crown of a tree standing at (x, z): it leans out, away from the house. */
+function crownFootprint(t: TreeShape, x: number, z: number): Footprint {
+  const d = Math.hypot(x, z) || 1;
+  const off = 0.12 * t.R + Math.tan(t.lean) * t.trunkH * 1.2;
+  return circleFootprint(x + (x / d) * off, z + (z / d) * off, 1.22 * t.R);
+}
+
+/** Somewhere for a tree: on the -X side or behind the house, its crown clear of the roof and of anything it would hit. */
+function treeSpot(site: Site, rng: Rng, tree: TreeShape, prefer: 'side' | 'back'): PlanPoint | null {
+  const { bounds } = site.layout;
+  const ground = site.layout.storeys[0];
+  const { R } = tree;
+  // The crown (lumps bulge to ~1.35 R from the trunk, leaning out) stays
+  // within ~4.3 m of the house's bounds.
+  const room = Math.max(0.2, 4.1 - 2.35 * R);
+  for (let i = 0; i < 45; i++) {
+    // Tiers: the front half of the -X side (it shows beside the house in the
+    // default view from +X+Z, never between it and the door), then all of
+    // that side, then behind the house (first and last swapped for 'back').
+    const tier = i < 15 ? 0 : i < 27 ? 1 : 2;
+    const side = prefer === 'side' ? tier < 2 : tier === 2;
+    let x: number;
+    let z: number;
+    if (side) {
+      x = bounds.min.x - R - rng.range(0.15, room);
+      // Beside the gable rather than out in front of the corner, where it would fill the foreground seen from -X+Z.
+      z = tier === 0 || prefer !== 'side' ? rng.range(-0.3, ground.maxZ) : rng.range(ground.minZ - 0.8, ground.maxZ);
+    } else {
+      z = bounds.min.z - R - rng.range(0.15, room);
+      x = rng.range(bounds.min.x - 1.6, (bounds.min.x + bounds.max.x) / 2 + 0.6);
+    }
+    if (!site.fits(circleFootprint(x, z, 0.3), 0.1, 0.02)) continue;
+    const crown = crownFootprint(tree, x, z);
+    const bottom = crownBottom(tree);
+    if (!site.canopyFits(crown, bottom)) continue;
+    site.claim(circleFootprint(x, z, 0.22), 'solid');
+    site.canopies.push({ fp: crown, bottom });
+    return { x, z };
+  }
+  return null;
+}
+
+/**
+ * Fruit tree: a short trunk leaning a little away from the house, forking
+ * into a few branches under a lumpy round crown hung with fruit (and a few
+ * windfalls in the grass), on a ring of bare earth.
+ */
+function addFruitTree(b: PartBuilder, rng: Rng, site: Site, x: number, z: number, tree: TreeShape): void {
+  const detail = site.layout.detail;
+  const { R, trunkH, lean } = tree;
+  const away = new THREE.Vector3(x, 0, z).normalize();
+  const bark = vary('#6a5240', rng, 0.05, 0.04, 0.01);
+  const r0 = rng.range(0.13, 0.17);
+  // Trunk in two segments with a slight kink, leaning outwards.
+  const kink = new THREE.Vector3(rng.jitter(1), 0, rng.jitter(1)).normalize().multiplyScalar(0.05);
+  const p0 = new THREE.Vector3(x, -0.05, z);
+  const p1 = p0.clone().add(new THREE.Vector3(0, trunkH * 0.55, 0)).addScaledVector(away, Math.tan(lean) * trunkH * 0.55).add(kink);
+  const p2 = p1.clone().add(new THREE.Vector3(0, trunkH * 0.5, 0)).addScaledVector(away, Math.tan(lean * 1.4) * trunkH * 0.5);
+  limb(b, rng, p0, p1, r0, r0 * 0.88, bark);
+  limb(b, rng, p1, p2, r0 * 0.88, r0 * 0.75, bark);
+  // Root flare.
+  b.add(new THREE.ConeGeometry(r0 * 1.9, 0.22, 7, 1, true), 'wood', bark.clone().multiplyScalar(0.92), mat4(x, 0.08, z));
+  // Crown above the fork.
+  const crown = p2.clone().add(new THREE.Vector3(0, R * 0.55, 0)).addScaledVector(away, R * 0.12);
+  const y0 = crown.y - R;
+  const y1 = crown.y + R;
+  const paint = (p: THREE.Vector3, n: THREE.Vector3, out: THREE.Color) => {
+    const t = THREE.MathUtils.clamp((p.y - y0) / (y1 - y0), 0, 1);
+    out.multiplyScalar(0.62 + 0.42 * t + 0.1 * Math.max(0, n.y));
+  };
+  // Branches from the fork up into the crown.
+  for (let i = 0; i < 3; i++) {
+    const a = (i / 3) * Math.PI * 2 + rng.jitter(0.5);
+    const end = crown.clone().add(new THREE.Vector3(Math.cos(a) * R * 0.5, rng.range(-0.1, 0.25) * R, Math.sin(a) * R * 0.5));
+    limb(b, rng, p2, end, r0 * 0.6, r0 * 0.3, bark);
+  }
+  const green = rng.pick(['#5d8a3d', '#679444', '#58823a', '#6e9a48']);
+  const blobs: Blob[] = [];
+  const main: Blob = { x: crown.x, y: crown.y, z: crown.z, rx: R * 0.86, ry: R * 0.74, rz: R * 0.86, v: rng.int(0, BLOB_VARIANTS - 1) };
+  blobs.push(main);
+  const n = rng.int(5, 7);
+  const phase = rng.range(0, Math.PI * 2);
+  for (let i = 0; i < n; i++) {
+    const a = phase + (i / n) * Math.PI * 2 + rng.jitter(0.35);
+    const up = i % 2 === 0 ? rng.range(0.05, 0.4) : rng.range(-0.2, 0.05);
+    const s = rng.range(0.48, 0.62);
+    blobs.push({
+      x: crown.x + Math.cos(a) * R * 0.5,
+      y: crown.y + up * R,
+      z: crown.z + Math.sin(a) * R * 0.5,
+      rx: R * s,
+      ry: R * s * 0.88,
+      rz: R * s,
+      v: rng.int(0, BLOB_VARIANTS - 1),
+    });
+  }
+  blobs.push({ x: crown.x + rng.jitter(0.15), y: crown.y + R * 0.45, z: crown.z + rng.jitter(0.15), rx: R * 0.5, ry: R * 0.42, rz: R * 0.5, v: rng.int(0, BLOB_VARIANTS - 1) });
+  for (const [i, bl] of blobs.entries()) {
+    const c = vary(green, rng, 0.04, 0.04, 0.008);
+    if (bl.y > crown.y + R * 0.2) c.offsetHSL(0.005, 0.02, 0.03);
+    b.add(blobGeometry(i === 0 || bl.rx > 0.62 ? 2 : 1, bl.v), 'foliage', c, mat4(bl.x, bl.y, bl.z, 0, 0, 0, bl.rx, bl.ry, bl.rz), paint);
+  }
+  // Fruit on the outside of the crown, mostly on its sides and underneath.
+  const fruit = rng.pick(FRUIT);
+  const nFruit = Math.round(rng.range(12, 20) * detail);
+  for (let i = 0; i < nFruit; i++) {
+    const bl = blobs[1 + rng.int(0, blobs.length - 2)];
+    const d = new THREE.Vector3(rng.jitter(1), rng.range(-0.75, 0.45), rng.jitter(1)).normalize();
+    const p = blobSurface(bl, d, 0.02);
+    const fr = rng.range(0.045, 0.06);
+    b.add(FRUIT_BALL, 'flower', vary(rng.pick(fruit), rng, 0.05, 0.05, 0.01), mat4(p.x, p.y, p.z, 0, rng.range(0, 6), 0, fr, fr * 0.95, fr));
+  }
+  // Windfalls in the grass.
+  const fallen = rng.int(1, 4);
+  for (let i = 0; i < fallen; i++) {
+    const a = rng.range(0, Math.PI * 2);
+    const d = rng.range(0.35, R * 0.85);
+    const fx = x + Math.cos(a) * d;
+    const fz = z + Math.sin(a) * d;
+    if (!site.grassFits(fx, fz)) continue;
+    const fr = rng.range(0.045, 0.055);
+    b.add(FRUIT_BALL, 'flower', vary(rng.pick(fruit), rng, 0.05, 0.05, 0.01).multiplyScalar(0.9), mat4(fx, fr * 0.7, fz, 0, rng.range(0, 6), 0, fr, fr * 0.9, fr));
+  }
+  // Bare earth round the trunk.
+  const patch: GroundPatch = {
+    x,
+    z,
+    ax: 1,
+    az: 0,
+    ru: rng.range(0.38, 0.5),
+    rv: rng.range(0.38, 0.5),
+    color: mix(SOIL, PATH_EDGE, 0.35),
+    phase: rng.range(0, 6),
+  };
+  site.patches.push(patch);
+  addGroundPatch(b, rng, site, patch, null);
+  site.anchors.push({ x: x + 0.3, z: z + 0.2, wall: null }, { x: x - 0.25, z: z - 0.3, wall: null });
+}
+
+/** A tapered limb from a to c (world), radii ra → rc. */
+function limb(b: PartBuilder, rng: Rng, a: THREE.Vector3, c: THREE.Vector3, ra: number, rc: number, color: THREE.Color): void {
+  const d = c.clone().sub(a);
+  const len = d.length();
+  const q = new THREE.Quaternion().setFromUnitVectors(UP, d.multiplyScalar(1 / len));
+  const g = new THREE.CylinderGeometry(rc, ra, len + Math.min(ra, rc), 7, 1, true);
+  b.add(g, 'wood', vary(color, rng, 0.02, 0.02, 0), new THREE.Matrix4().compose(a.clone().add(c).multiplyScalar(0.5), q, new THREE.Vector3(1, 1, 1)));
+}
+
+/**
+ * Two or three round bushes grown together in a corner of the plot: where
+ * the fence turns, or where it meets the house.
+ */
+function buildShrubGroup(site: Site, rng: Rng, g: Garden): PartBuilder | null {
+  const p = g.pts;
+  const spots: { x: number; z: number; ix: number; iz: number }[] = [];
+  /** Outward normal of the run p[i] → p[i + 1]. */
+  const normal = (i: number) => {
+    const l = Math.hypot(p[i + 1].x - p[i].x, p[i + 1].z - p[i].z);
+    return { x: -(p[i + 1].z - p[i].z) / l, z: (p[i + 1].x - p[i].x) / l };
+  };
+  for (let i = 1; i < p.length - 1; i++) {
+    // Into the corner: against both runs' outward normals.
+    const a = normal(i - 1);
+    const c = normal(i);
+    const l = Math.hypot(a.x + c.x, a.z + c.z) || 1;
+    spots.push({ x: p[i].x, z: p[i].z, ix: -(a.x + c.x) / l, iz: -(a.z + c.z) / l });
+  }
+  for (let i = spots.length - 1; i > 0; i--) {
+    const j = rng.int(0, i);
+    [spots[i], spots[j]] = [spots[j], spots[i]];
+  }
+  const leafy = flowerColors(site.palette);
+  for (const sp of spots) {
+    const b = new PartBuilder('props:shrubs');
+    let placed = 0;
+    const n = rng.int(2, 3);
+    let d = rng.range(0.45, 0.6);
+    for (let k = 0; k < n * 3 && placed < n; k++) {
+      const w = rng.range(0.55, 0.85) * (placed ? 0.82 : 1);
+      const h = Math.min(1.2, w * rng.range(0.85, 1.25));
+      const a = rng.jitter(0.9);
+      const ix = sp.ix * Math.cos(a) - sp.iz * Math.sin(a);
+      const iz = sp.ix * Math.sin(a) + sp.iz * Math.cos(a);
+      const cx = sp.x + ix * d;
+      const cz = sp.z + iz * d;
+      const fp = circleFootprint(cx, cz, w / 2);
+      if (!inGarden(g, cx, cz) || !site.fits(fp, 0.06, -0.12) || site.headroom(fp) < h + 0.1) {
+        d += 0.12;
+        continue;
+      }
+      site.claim(fp, 'plant', h);
+      const m = planMatrix(cx, cz, ix, iz);
+      addShrub(b, rng, m, w, h, w * rng.range(0.85, 1), rng.chance(0.3) ? rng.pick(leafy) : null);
+      site.anchors.push({ x: cx + ix * w * 0.5, z: cz + iz * w * 0.5, wall: null });
+      placed++;
+      d += w * 0.45;
+    }
+    if (placed) {
+      b.explode = radialExplode(sp.x, sp.z);
+      return b;
+    }
+  }
+  return null;
 }

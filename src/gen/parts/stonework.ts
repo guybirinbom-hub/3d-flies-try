@@ -88,7 +88,7 @@ const JOIST_DEPTH = 0.1;
  * Rough stonework triangles per m² of stone face at full detail and normal
  * stone size, and what we aim for (ARCHITECTURE.md budgets 120k; keep margin).
  */
-const TRIANGLES_PER_M2 = 450;
+const TRIANGLES_PER_M2 = 520;
 const TRIANGLE_TARGET = 100_000;
 /** Largest stone size scale on a huge stone house. */
 const MAX_SCALE = 1.3;
@@ -767,13 +767,15 @@ interface StoneProfile {
 }
 
 /**
- * Low-poly field stone (60 triangles; 40 at detail 2), centred on x/y, with
- * z = w. The outline is a rounded rectangle (three points per corner, each
- * corner its own radius)
- * with every point nudged a little inward, so no two stones share a silhouette
- * and none leaves its slot. Side walls rise from the buried back (no back cap:
- * it is inside the wall) to a shoulder, then an inset front ring and a domed
- * crown. Indexed, so normals come out smooth and the stone reads as a pillow.
+ * Low-poly field stone (70 triangles; 46 with two points per corner), centred
+ * on x/y, with z = w. The outline is a rounded rectangle (three points per
+ * corner, each corner its own radius) with every point nudged a little
+ * inward, so no two stones share a silhouette and none leaves its slot. Side
+ * walls rise from the buried back to a shoulder, then an inset front ring and
+ * a domed crown. Indexed, so normals come out smooth and the stone reads as a
+ * pillow. The back is closed by a flat fan on its own copy of the base ring
+ * (so it does not round off the side walls): it is buried in the wall, but
+ * the exploded view pulls the stones off the wall and shows it.
  */
 function fieldStoneGeometry(sx: number, sy: number, p: StoneProfile, perCorner: number, rng: Rng): THREE.BufferGeometry {
   const hx = sx / 2;
@@ -806,6 +808,8 @@ function fieldStoneGeometry(sx: number, sy: number, p: StoneProfile, perCorner: 
   for (const [x, y] of ring) pos.push(x, y, p.shoulder);
   for (const [x, y] of ring) pos.push(x * kx, y * ky, p.face + rng.jitter(FACE_JITTER));
   pos.push(rng.jitter(hx * 0.2), rng.jitter(hy * 0.2), p.crown);
+  // The back cap's own ring (same positions as the base ring, so lumps keep it welded).
+  for (const [x, y] of ring) pos.push(x, y, p.back);
 
   const n = ring.length;
   const index: number[] = [];
@@ -818,6 +822,9 @@ function fieldStoneGeometry(sx: number, sy: number, p: StoneProfile, perCorner: 
   }
   const centre = 3 * n;
   for (let i = 0; i < n; i++) index.push(centre, 2 * n + i, 2 * n + ((i + 1) % n));
+  // Back cap: a fan facing -z (the ring runs counter-clockwise seen from +z).
+  const back = 3 * n + 1;
+  for (let i = 1; i + 1 < n; i++) index.push(back, back + i + 1, back + i);
 
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
@@ -828,9 +835,11 @@ function fieldStoneGeometry(sx: number, sy: number, p: StoneProfile, perCorner: 
 /**
  * Closed chamfered block (56 triangles) centred on the origin: six faces
  * (each fanned from a centre vertex so it stays flat in the middle), twelve
- * bevelled edges and eight corner facets.
+ * bevelled edges and eight corner facets. Indexed without normals (the
+ * builder smooths them). The dormers' quoins use it too, so dressed stone
+ * looks the same on the house and on its dormers.
  */
-function chamferedBlock(sx: number, sy: number, sz: number, chamfer: number): THREE.BufferGeometry {
+export function chamferedBlock(sx: number, sy: number, sz: number, chamfer: number): THREE.BufferGeometry {
   const half = [sx / 2, sy / 2, sz / 2];
   const c = Math.min(chamfer, ...half.map((h) => h * 0.45));
   const pos: number[] = [];

@@ -6,12 +6,17 @@ import type { PartDef } from '../house';
 import { roofSurfaceY, type DormerSpec, type HouseLayout, type RoofCovering, type RoofSpec } from '../layout';
 import type { Palette } from '../params';
 import type { Rng } from '../rng';
+import { tileCourses, type TileCourses } from './roof';
+import { chamferedBlock } from './stonework';
 
 /**
  * Dormers: every dormer in `layout.roof.dormers` — the face wall with its
  * window, the two cheeks, the dormer's own little roof (gabled or shed),
- * and the lead work where it all meets the main roof (apron, side flashing,
- * open valleys, a saddle at the ridge end).
+ * and the lead work where it all meets the main roof: a collar (apron and
+ * side strips) and a saddle at a gabled dormer's ridge end dressed over the
+ * main roof's real tile tops (`tileCourses` from the roof part), cover
+ * flashing up the cheeks, open valleys, and over a shed dormer's roof a
+ * sheet tucked up under the main roof's tiles.
  *
  * The main roof leaves its covering open over each dormer's plan rectangle
  * (`roof.holes`); a dormer covers all of it: the cheeks and face stand on
@@ -56,10 +61,22 @@ const PATCH_EXT = 0.015;
 /** Lead flashing: width over the tiles beside the cheeks / in front of the face. */
 const FLASH_SIDE = 0.12;
 const FLASH_APRON = 0.2;
+/**
+ * Dressed lead sheets: thickness at free edges and in the body, the width
+ * of the taper between them, air over the tile tops, and the length over
+ * which a sheet slopes down a course's tail step.
+ */
+const LEAD_SHEET = { edge: 0.003, body: 0.0065, taper: 0.035, clear: 0.003, ramp: 0.035 } as const;
+/** Cover flashing up the cheeks: how high it stands over the (average) tile surface. */
+const COVER_UP = 0.075;
 const WINDOW_FRAME = 0.06;
 const GLAZING_BAR = 0.03;
 /** Window frame plane (w, set back into the face wall). */
 const RECESS = -0.055;
+/** Shortest field stone on a stone face; narrower gaps stay a wide joint. */
+const MIN_FACE_STONE = 0.12;
+/** Narrowest gap a quoin leaves before a window surround (field stones in it look like pebbles). */
+const MIN_JAMB_STONE = 0.2;
 
 const LEAD = '#737c85';
 const GLASS = '#3a5566';
@@ -104,10 +121,11 @@ function tileRise(t: TileSpec): number {
 }
 
 /**
- * The main roof's tile courses (as the roof part lays them): tile size, and
- * the slope-local Z (down the slope from the ridge, along the underside) of
- * the eave course's tail and the course gauge. Used to lay the patches behind
- * gabled dormers in step with the surrounding courses.
+ * The main roof's tile courses (as the roof part lays them, from its
+ * `tileCourses`): tile size, the slope-local Z (down the slope from the
+ * ridge, along the underside) of the eave course's tail and the course
+ * gauge. Used to lay the patches behind gabled dormers in step with the
+ * surrounding courses.
  */
 interface MainCourses {
   tile: TileSpec;
@@ -117,24 +135,16 @@ interface MainCourses {
   tilt: number;
 }
 
-function mainCourses(layout: HouseLayout): MainCourses {
+function mainCourses(layout: HouseLayout, tc: TileCourses): MainCourses {
   const r = layout.roof;
   const style = TILE_STYLES[r.covering];
   const cos = Math.cos(r.pitch);
-  const tan = Math.tan(r.pitch);
   const xEnd = (r.maxX - r.minX) / 2 + r.overhangGable;
   const zMax = (r.halfDepth + r.overhangEave) / cos;
+  // The roof's tile scale (bigger tiles on very large roofs).
   const scale = clamp(Math.sqrt((2 * xEnd * zMax) / (style.width * style.gauge) / 1500), 1, 1.75);
   const tile: TileSpec = { ...style, width: style.width * scale, length: style.length * scale, gauge: style.gauge * scale };
-  const rise = tileRise(tile);
-  const yHead = r.deckThickness + 0.004;
-  const tileTop = yHead + rise + tile.thickness + 0.011 + 0.004;
-  const capT = Math.max(0.035, 0.07 * (1 - cos) + 0.015);
-  const capZ = Math.max(-(tileTop + capT - 0.07) * tan + 0.1, -r.deckThickness * tan + 0.06);
-  const eaveTail = zMax + r.fasciaThickness + 0.04;
-  const lastTail = capZ - 0.03;
-  const courses = Math.max(2, Math.round((eaveTail - lastTail) / tile.gauge) + 1);
-  return { tile, eaveTail, gauge: (eaveTail - lastTail) / (courses - 1), yHead, tilt: Math.atan2(rise, tile.length) };
+  return { tile, eaveTail: tc.tail(0), gauge: tc.gauge, yHead: tc.deck + 0.004, tilt: Math.atan2(tileRise(tile), tile.length) };
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +170,8 @@ interface Look {
   tile: TileSpec;
   hung: TileSpec;
   main: MainCourses;
+  /** The main roof's real tile tops (lead is dressed over them). */
+  tc: TileCourses;
   tiles: TilePalette;
 }
 
@@ -179,6 +191,7 @@ function chooseLook(layout: HouseLayout, rng: Rng): Look {
   // Hung tiles on the cheeks: small plain tiles (round-ended under clay roofs).
   const hungKind: RoofCovering = base.kind === 'beaver' || base.kind === 'fish' ? base.kind : 'slate';
   const hung = { ...scaledTiles(TILE_STYLES[hungKind], 0.72 / Math.sqrt(clamp(layout.detail, 0.45, 1)), 0.75), irregular: false };
+  const tc = tileCourses(layout);
   return {
     pal,
     cheek,
@@ -192,7 +205,8 @@ function chooseLook(layout: HouseLayout, rng: Rng): Look {
     boardedGable: rng.chance(0.6),
     tile,
     hung,
-    main: mainCourses(layout),
+    main: mainCourses(layout, tc),
+    tc,
     tiles: new TilePalette(base, pal.roof, rng.fork('palette')),
   };
 }
@@ -509,56 +523,38 @@ function facePlaster(k: Kit, rng: Rng): void {
 
 /**
  * Stone face: field stones in courses over a mortar body, dressed quoins at
- * both corners (wrapping onto the cheeks), a stone lintel or arch over the
- * window. In a gable the stones are squeezed under the gable edge.
+ * both corners (each one block wrapping round onto the cheek), a stone lintel
+ * or arch over the window. The quoin courses meet the sill, the window head
+ * and the top of the lintel; beside the window a quoin reaches right up to
+ * the surround whenever the gap left would only take a pebble. In a gable the
+ * courses stop where a stone no longer fits under the gable edge, and every
+ * stone is squeezed under it.
  */
 function faceStones(k: Kit, rng: Rng): void {
   const { g, look } = k;
   const F = faceFrame(g);
   const W = 2 * g.hw;
   const w = g.win;
+  // Highest a stone may reach at u: the dormer roof's underside, less a little clearance.
   const top = (u: number) => (g.gable ? g.ridgeY - Math.abs(u - g.hw) * g.tD : g.eaveY) - 0.03;
   // The apron's upstand covers the foot of the face; the stones start above it.
   const yBottom = g.baseY + 0.1;
-
-  // Quoins: alternating long / short, on the face and wrapping round onto the
-  // cheek (just over the face wall's edge when the cheek has its own cladding).
-  const quoinTop = g.eaveY - 0.02;
-  const nQ = Math.max(3, Math.round((quoinTop - yBottom) / 0.26));
-  const qh = (quoinTop - yBottom) / nQ;
-  const quoinAlong: number[] = [];
-  // Long quoins reach the window jamb when the pier is narrow (no slivers of mortar).
   const pier = Math.min(w.u0, W - w.u1);
-  const longQ = pier < 0.36 ? pier - 0.03 : 0.24;
-  const shortQ = Math.min(0.15, longQ * 0.62);
-  for (let i = 0; i < nQ; i++) {
-    const y0 = yBottom + i * qh + 0.006;
-    const y1 = yBottom + (i + 1) * qh - 0.006;
-    const long = i % 2 === 0;
-    const along = long ? longQ : shortQ;
-    quoinAlong.push(along);
-    for (const s of [-1, 1] as const) {
-      const side = look.cheek === 'plaster' ? (long ? 0.1 : 0.2) : 0.012;
-      const c = vary(look.dressedStone, rng, 0.05, 0.03, 0.006);
-      const u0 = s < 0 ? 0 : W - along;
-      const u1 = s < 0 ? along : W;
-      put(k, prism(rect(u0, u1, y0, y1), -0.03, 0.055 + rng.jitter(0.004), 0.02), 'stone', c, F);
-      const [ua, ub] = behind(s, -0.055, FACE_T + side);
-      put(k, prism(rect(ua, ub, y0, y1), -0.03, 0.05 + rng.jitter(0.004), 0.02), 'stone', c, cheekFrame(g, s));
-    }
-  }
+  const uc = (w.u0 + w.u1) / 2;
+  const r = (w.u1 - w.u0) / 2;
+  const spring = w.y1 - r;
 
-  // Window head: a stone lintel, or a ring of voussoirs round an arch.
+  // Window head: a stone lintel, or a ring of voussoirs round an arch. Both
+  // bear a little less on a narrow pier, so a quoin still fits beside them.
+  const bearing = clamp(pier - 0.17, 0.07, 0.13);
+  const ring = clamp(pier * 0.45, 0.09, 0.14);
   const lintelTop = Math.min(w.y1 + 0.17, g.eaveY - 0.03);
   if (w.arched) {
-    const uc = (w.u0 + w.u1) / 2;
-    const r = (w.u1 - w.u0) / 2;
-    const spring = w.y1 - r;
     const n = 7;
     for (let i = 0; i < n; i++) {
       const a0 = (Math.PI * i) / n + 0.012;
       const a1 = (Math.PI * (i + 1)) / n - 0.012;
-      const r1 = r + (i === 3 ? 0.17 : 0.14);
+      const r1 = r + ring + (i === 3 ? 0.03 : 0);
       const poly: V2[] = [];
       for (const a of [a0, (a0 + a1) / 2, a1]) poly.push([uc + (r - 0.01) * Math.cos(a), spring + (r - 0.01) * Math.sin(a)]);
       for (const a of [a1, a0]) poly.push([uc + r1 * Math.cos(a), spring + r1 * Math.sin(a)]);
@@ -566,24 +562,93 @@ function faceStones(k: Kit, rng: Rng): void {
       put(k, prism(poly, -0.03, i === 3 ? 0.065 : 0.055, 0.014), 'stone', c, F);
     }
   } else {
-    put(k, prism(rect(w.u0 - 0.13, w.u1 + 0.13, w.y1 - 0.01, lintelTop), -0.03, 0.06, 0.02), 'stone', vary(look.dressedStone, rng, 0.04, 0.03, 0.005), F);
+    put(k, prism(rect(w.u0 - bearing, w.u1 + bearing, w.y1 - 0.01, lintelTop), -0.03, 0.06, 0.02), 'stone', vary(look.dressedStone, rng, 0.04, 0.03, 0.005), F);
+  }
+
+  // Zones of the window surround that stones keep out of: a height range and
+  // the half-width (about the window's centre line) to keep clear over a
+  // band [ya, yb] of it. Round an arch that follows the voussoirs' outer
+  // circle, so the stones fill the spandrels course by course.
+  const sillBottom = w.y0 - 0.075;
+  const headStart = w.arched ? spring : w.y1 - 0.01;
+  const headEnd = w.arched ? w.y1 + ring + 0.05 : lintelTop + 0.008;
+  // The voussoirs' outer circle, and the keystone standing a little proud of it at the crown.
+  const archHalf = (ya: number) => {
+    const dy = Math.max(0, ya - spring);
+    const R = r + ring;
+    const ring0 = Math.sqrt(Math.max(0, R * R - dy * dy));
+    const key = dy < R + 0.03 ? (R + 0.03) * Math.sin(Math.PI / 14) : 0;
+    return Math.max(ring0, key) + 0.016;
+  };
+  const zones: { y0: number; y1: number; half: (ya: number, yb: number) => number }[] = [
+    { y0: sillBottom - 0.008, y1: w.y0 + 0.025, half: () => r + 0.08 },
+    { y0: w.y0 + 0.025, y1: headStart, half: () => r + 0.016 },
+    { y0: headStart, y1: headEnd, half: w.arched ? archHalf : () => r + bearing + 0.01 },
+  ];
+  /** Half-width to keep clear over [ya, yb] (0 when no zone is touched). */
+  const clearHalf = (ya: number, yb: number) => {
+    let h = 0;
+    for (const z of zones) if (ya < z.y1 - 1e-6 && yb > z.y0 + 1e-6) h = Math.max(h, z.half(Math.max(ya, z.y0), Math.min(yb, z.y1)));
+    return h;
+  };
+
+  // Quoin courses: up to the top of the sill, up the jambs to the head,
+  // beside the head and on up to the eave (thin leftovers join a neighbour).
+  const quoinTop = g.eaveY - 0.02;
+  const qLines = [yBottom];
+  for (const key of [zones[0].y1, headStart, headEnd, quoinTop]) {
+    const a = qLines[qLines.length - 1];
+    const span = Math.min(key, quoinTop) - a;
+    if (span < 0.15) continue;
+    const n = Math.max(1, Math.round(span / 0.27));
+    for (let j = 1; j <= n; j++) qLines.push(a + (span * j) / n);
+  }
+  if (qLines[qLines.length - 1] < quoinTop - 1e-6) {
+    if (qLines.length > 1) qLines[qLines.length - 1] = quoinTop;
+    else qLines.push(quoinTop);
+  }
+  // Long and short in turn, but never leaving room for only a pebble before
+  // the surround: then the quoin runs on to it (on a narrow pier every quoin
+  // beside the window does, like dressed jamb stones).
+  const longQ = Math.min(0.24, pier - 0.03);
+  const shortQ = Math.min(0.15, longQ * 0.62);
+  const quoins: { y0: number; y1: number; along: number; long: boolean }[] = [];
+  for (let i = 0; i + 1 < qLines.length; i++) {
+    const y0 = qLines[i];
+    const y1 = qLines[i + 1];
+    const long = i % 2 === 0;
+    let along = long ? longQ : shortQ;
+    const half = clearHalf(y0, y1);
+    const edge = half > 0 ? uc - half : Infinity;
+    if (edge < Infinity) {
+      along = Math.min(along, edge - 0.012);
+      if (edge - along - 0.014 < MIN_JAMB_STONE) along = edge - 0.012;
+    }
+    quoins.push({ y0, y1, along, long });
+  }
+  // Each quoin is one block: along the face, round the corner (standing
+  // `wrap` proud of the cheek) and back along the cheek (just over the face
+  // wall's edge when the cheek has its own cladding).
+  const wrap = 0.05;
+  for (const q of quoins) {
+    for (const s of [-1, 1] as const) {
+      const depth = FACE_T + (look.cheek === 'plaster' ? (q.long ? 0.1 : 0.2) : 0.012);
+      const front = 0.055 + rng.jitter(0.004);
+      const yb = q.y0 + 0.006;
+      const yt = q.y1 - 0.006;
+      const block = lumpify(chamferedBlock(q.along + wrap, yt - yb, depth + front, 0.02), 0.003, rng.int(0, 1e6));
+      const um = s < 0 ? (q.along - wrap) / 2 : W - (q.along - wrap) / 2;
+      block.translate(um, (yb + yt) / 2, (front - depth) / 2);
+      // Where it wraps past the corner it stays under the dormer roof.
+      squeezeUnder(block, top, yb, yt);
+      put(k, block, 'stone', vary(look.dressedStone, rng, 0.05, 0.03, 0.006), F);
+    }
   }
 
   // Field stones in courses, keeping out of the window surround and the
   // quoins; course lines fall on the sill and the window head.
-  const sillBottom = w.y0 - 0.075;
-  const uc = (w.u0 + w.u1) / 2;
-  const r = (w.u1 - w.u0) / 2;
-  const headStart = w.arched ? w.y1 - r : w.y1 - 0.01;
-  const headEnd = w.arched ? w.y1 + 0.19 : lintelTop + 0.008;
-  // Zones of the window surround: [y0, y1] → the u-range stones keep out of.
-  const zones: [number, number, number, number][] = [
-    [sillBottom - 0.008, w.y0 + 0.025, w.u0 - 0.08, w.u1 + 0.08],
-    [w.y0 + 0.025, headStart, w.u0 - 0.016, w.u1 + 0.016],
-    [headStart, headEnd, w.arched ? uc - r - 0.17 : w.u0 - 0.14, w.arched ? uc + r + 0.17 : w.u1 + 0.14],
-  ];
   const yTop = g.gable ? g.ridgeY - 0.05 : g.eaveY - 0.03;
-  const lines = [yBottom, sillBottom - 0.008, w.y0 + 0.025, headStart, headEnd, yTop].filter((v, i, a) => i === 0 || v > a[i - 1] + 1e-3);
+  const lines = [yBottom, zones[0].y0, zones[0].y1, headStart, headEnd, yTop].filter((v, i, a) => i === 0 || v > a[i - 1] + 1e-3);
   const rows: [number, number][] = [];
   for (let i = 0; i + 1 < lines.length; i++) {
     const span = lines[i + 1] - lines[i];
@@ -594,53 +659,107 @@ function faceStones(k: Kit, rng: Rng): void {
   rows.forEach(([ya, yb], row) => {
     const y0 = ya + 0.007;
     const y1 = yb - 0.007;
-    // Clear of every quoin band the course touches.
+    // Clear of every quoin course the row touches …
     let along = 0;
-    quoinAlong.forEach((a, i) => {
-      const q0 = yBottom + i * qh;
-      if (y0 < q0 + qh && y1 > q0) along = Math.max(along, a);
-    });
+    for (const q of quoins) if (y0 < q.y1 && y1 > q.y0) along = Math.max(along, q.along);
     const qa = along ? along + 0.014 : 0.01;
     let spans: [number, number][] = [[qa, W - qa]];
-    for (const [z0, z1, k0, k1] of zones) {
-      if (y1 <= z0 || y0 >= z1) continue;
-      spans = spans.flatMap(([a, c]) => [[a, Math.min(c, k0)], [Math.max(a, k1), c]] as [number, number][]);
+    // … and, in a gable, only where a stone keeps some height under the edge.
+    if (g.gable) {
+      const room = (top(g.hw) - (y0 + 0.05)) / g.tD;
+      if (room <= 0) return;
+      spans = [[Math.max(qa, g.hw - room), Math.min(W - qa, g.hw + room)]];
     }
+    // Beside an arch the course runs in to where the voussoirs are narrowest
+    // (its top), and the stones next to them are shaped to the ring.
+    const inArch = w.arched && y0 >= headStart - 1e-6 && y1 <= headEnd + 1e-6;
+    const half = inArch ? archHalf(y1) : clearHalf(y0, y1);
+    if (half > 0) spans = spans.flatMap(([a, c]) => [[a, Math.min(c, uc - half)], [Math.max(a, uc + half), c]] as [number, number][]);
     for (const [a, c] of spans) {
-      if (c - a < 0.06) continue;
+      // Too narrow for a proper stone: leave it as a wide joint.
+      if (c - a < MIN_FACE_STONE) continue;
+      // A thin course (under the sill) is one long levelling stone, not a row of pebbles.
+      const thin = y1 - y0 < 0.08;
       let u = a;
       let first = true;
       while (u < c - 0.05) {
-        let len = rng.range(0.2, 0.34) * (first && row % 2 ? 0.6 : 1);
+        let len = thin ? c - u : rng.range(0.2, 0.34) * (first && row % 2 ? 0.6 : 1);
         first = false;
-        if (c - (u + len) < 0.12) len = c - u;
-        const u0 = u + 0.007;
-        const u1 = u + len - 0.007;
+        if (c - (u + len) < MIN_FACE_STONE) len = c - u;
+        const s0 = u + 0.007;
+        const s1 = u + len - 0.007;
         u += len;
-        if (Math.max(top(u0), top(u1)) - y0 < 0.06) continue;
-        stone(k, F, u0, u1, y0, y1, top, look.pal.stone, rng);
+        // Against the arch: the side facing it follows the ring (skip it if that leaves a sliver).
+        let side: SideLimit | undefined;
+        if (inArch && (Math.abs(s1 - (uc - half)) < 0.02 || Math.abs(s0 - (uc + half)) < 0.02)) {
+          const dir = s1 <= uc ? -1 : 1;
+          side = { dir, at: (y) => uc + dir * archHalf(y) };
+          const mid = side.at((y0 + y1) / 2);
+          if ((dir < 0 ? mid - s0 : s1 - mid) < 0.06) continue;
+        }
+        stone(k, F, s0, s1, y0, y1, top, look.pal.stone, rng, side);
       }
     }
   });
 }
 
-/** One rounded field stone on the face, its top squeezed under `top(u)`. */
-function stone(k: Kit, F: THREE.Matrix4, u0: number, u1: number, y0: number, y1: number, top: (u: number) => number, base: string, rng: Rng): void {
-  const g = fieldStone(u1 - u0, y1 - y0, rng);
-  g.translate((u0 + u1) / 2, (y0 + y1) / 2, 0);
-  const pos = g.attributes.position as THREE.BufferAttribute;
+/** A stone's side that must stay on one side of a curve: u ≤ at(y) (dir -1) or u ≥ at(y) (dir +1). */
+interface SideLimit {
+  dir: -1 | 1;
+  at: (y: number) => number;
+}
+
+/**
+ * Squeeze geometry (face-local, nominally y ∈ [y0, y1]) under `top(u)`:
+ * where the line is lower than y1 its height is scaled down towards y0, and
+ * nothing is left above the line.
+ */
+function squeezeUnder(geom: THREE.BufferGeometry, top: (u: number) => number, y0: number, y1: number): void {
+  const pos = geom.attributes.position as THREE.BufferAttribute;
   for (let i = 0; i < pos.count; i++) {
     const c = top(pos.getX(i));
-    const yy = pos.getY(i);
-    if (c < y1) pos.setY(i, y0 + (yy - y0) * Math.max(0, (c - y0) / (y1 - y0)));
+    let y = pos.getY(i);
+    if (c < y1) y = y0 + (y - y0) * Math.max(0, (c - y0) / (y1 - y0));
+    pos.setY(i, Math.min(y, c));
   }
-  g.computeVertexNormals();
+  pos.needsUpdate = true;
+  geom.computeVertexNormals();
+}
+
+/**
+ * One rounded field stone on the face in [u0, u1] × [y0, y1], squeezed under
+ * `top(u)` and, with `side`, squeezed sideways (from its far end) to keep
+ * clear of a curve.
+ */
+function stone(k: Kit, F: THREE.Matrix4, u0: number, u1: number, y0: number, y1: number, top: (u: number) => number, base: string, rng: Rng, side?: SideLimit): void {
+  const g = fieldStone(u1 - u0, y1 - y0, rng);
+  g.translate((u0 + u1) / 2, (y0 + y1) / 2, 0);
+  if (side) {
+    const pos = g.attributes.position as THREE.BufferAttribute;
+    for (let i = 0; i < pos.count; i++) {
+      const lim = side.at(pos.getY(i));
+      let u = pos.getX(i);
+      if (side.dir < 0) {
+        if (lim < u1) u = u0 + (u - u0) * Math.max(0, (lim - u0) / (u1 - u0));
+        u = Math.min(u, lim);
+      } else {
+        if (lim > u0) u = u1 - (u1 - u) * Math.max(0, (u1 - lim) / (u1 - u0));
+        u = Math.max(u, lim);
+      }
+      pos.setX(i, u);
+    }
+  }
+  squeezeUnder(g, top, y0, y1);
   const color = vary(base, rng, 0.07, 0.05, 0.012);
   if (rng.chance(0.15)) color.multiplyScalar(rng.range(0.85, 0.95));
   put(k, g, 'stone', color, F);
 }
 
-/** Pillowy field stone centred on the origin (x, y), from w = -0.03 up to a domed front. */
+/**
+ * Pillowy field stone centred on the origin (x, y), from w = -0.03 up to a
+ * domed front, its back closed by a flat fan (the exploded view lifts the
+ * dormer off the roof).
+ */
 function fieldStone(sx: number, sy: number, rng: Rng): THREE.BufferGeometry {
   const hx = sx / 2;
   const hy = sy / 2;
@@ -664,6 +783,8 @@ function fieldStone(sx: number, sy: number, rng: Rng): THREE.BufferGeometry {
   for (const [x, y] of ring) pos.push(x, y, shoulder);
   for (const [x, y] of ring) pos.push(x * kx, y * ky, face + rng.jitter(0.003));
   pos.push(rng.jitter(hx * 0.2), rng.jitter(hy * 0.2), face + rng.range(0.006, 0.012));
+  // The back cap's own copy of the base ring (lumps keep it welded, normals stay apart).
+  for (const [x, y] of ring) pos.push(x, y, -0.03);
   const n = ring.length;
   const index: number[] = [];
   for (let r = 0; r < 2; r++) {
@@ -674,6 +795,8 @@ function fieldStone(sx: number, sy: number, rng: Rng): THREE.BufferGeometry {
     }
   }
   for (let i = 0; i < n; i++) index.push(3 * n, 2 * n + i, 2 * n + ((i + 1) % n));
+  const back = 3 * n + 1;
+  for (let i = 1; i + 1 < n; i++) index.push(back, back + i + 1, back + i);
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
   g.setIndex(index);
@@ -1103,8 +1226,16 @@ function buildGableRoof(k: Kit, rng: Rng): void {
       const m = new THREE.Matrix4().makeTranslation(0, rng.jitter(0.003), 0);
       put(k, sweepZ(ridge, z0, z1, 0.05, [g.xc, g.ridgeY + DECK / g.cD]), 'roof', vary(ridgeColor, rng, 0.02, 0.02, 0.004), m);
     }
-    const zs = Math.max(0.04, zEnd - 0.16);
-    leadOnRoof(k, g.xc - 0.17, g.xc + 0.17, zs, zEnd + 0.12, 0.018, 0.003, k.lead, { x0: true, x1: true, za: true, zb: true });
+    // The saddle: lead dressed over the main roof's tiles round the junction.
+    const tc = look.tc;
+    const E = LEAD_SHEET.taper;
+    const zLow = mainZ(g, zEnd + 0.12);
+    const want = mainZ(g, Math.max(0.04, zEnd - 0.16));
+    const zHigh = restingEdge(tc, want, Math.max(want - 0.05, tc.ridgeLimit + 0.03), Math.min(want + 0.05, zLow - 0.12));
+    const xa = g.xc - 0.17;
+    const xb = g.xc + 0.17;
+    const zs = slopeLines(tc, zHigh, zLow, [zHigh, zHigh + E, zLow - E, zLow]);
+    drapeMain(k, [xa, xa + E, xb - E, xb], zs, (x, Z) => leadThickness(Math.min(x - xa, xb - x, Z - zHigh, zLow - Z)));
   }
 
   if (look.finial) {
@@ -1160,7 +1291,9 @@ function mainPatch(k: Kit, s: number, rng: Rng): void {
 /**
  * One wing of an open lead valley in a slope frame: a thin sheet along the
  * valley line, a little below the tile surface (`y` is its top), reaching
- * under the tiles on its side and just past the valley under the other wing.
+ * well under the clipped tiles on its side and on past the valley line, far
+ * enough to pass under the other wing (both lie below their own slope's
+ * tiles, so the two only meet a few centimetres beyond the valley line).
  */
 function valleyLead(k: Kit, frame: THREE.Matrix4, p: V2, q: V2, inside: V2, y: number, minZ = -Infinity): void {
   const dx = q[0] - p[0];
@@ -1176,11 +1309,13 @@ function valleyLead(k: Kit, frame: THREE.Matrix4, p: V2, q: V2, inside: V2, y: n
   }
   const a: V2 = [p[0] - tx * 0.04, p[1] - tz * 0.04];
   const b: V2 = [q[0] + tx * 0.03, q[1] + tz * 0.03];
+  const past = 0.07;
+  const under = 0.16;
   const poly: V2[] = [
-    [a[0] - nx * 0.03, a[1] - nz * 0.03],
-    [b[0] - nx * 0.03, b[1] - nz * 0.03],
-    [b[0] + nx * 0.15, b[1] + nz * 0.15],
-    [a[0] + nx * 0.15, a[1] + nz * 0.15],
+    [a[0] - nx * past, a[1] - nz * past],
+    [b[0] - nx * past, b[1] - nz * past],
+    [b[0] + nx * under, b[1] + nz * under],
+    [a[0] + nx * under, a[1] + nz * under],
   ];
   put(k, slabXZ(clipHalf(poly, 0, -1, -minZ), y - 0.014, y), 'mortar', k.lead, frame);
 }
@@ -1301,19 +1436,15 @@ function buildShedRoof(k: Kit, rng: Rng): void {
   const Zf = (g.zFront - g.backZ) / g.cD;
 
   put(k, slabXZ(rect(-half, half, Zj - 0.12, Zf), 0, DECK), 'wood', shade(look.pal.wood, -0.12), S);
-  const rise = tileRise(t);
+  const tilt = Math.atan2(tileRise(t), t.length);
   const tail0 = Zf + 0.045;
   const top = Zj - 0.06;
   const n = Math.max(2, Math.round((tail0 - top - t.length * 0.6) / t.gauge) + 1);
   const lastTail = top + t.length * 0.6;
-  layTiles(k, S, rect(-half, half, top, tail0), t, DECK + 0.003, { tail0, gauge: (tail0 - lastTail) / (n - 1), minZ: lastTail - 0.01, tilt: Math.atan2(rise, t.length) }, rng);
-
-  // Lead flashing over the top course, tucked up under the main roof's tiles.
-  const lead = k.lead;
-  put(k, slabXZ(rect(-half - 0.02, half + 0.02, Zj - 0.03, Zj + 0.11), g.cover - 0.012, g.cover + 0.016), 'mortar', lead, S);
-  const M = mainFrame(g);
-  const J = localXZ(M, new THREE.Vector3(g.xc, surf(g, zj), zj));
-  put(k, slabXZ(rect(g.xc - half - 0.02, g.xc + half + 0.02, J[1] - 0.14, J[1] + 0.035), g.roof.coverThickness - 0.035, g.roof.coverThickness - 0.008), 'mortar', lead, M);
+  const yHead = DECK + 0.003;
+  // The top course lies calm (no hand-laid jitter): the lead is dressed over it.
+  layTiles(k, S, rect(-half, half, top, tail0), t, yHead, { tail0, gauge: (tail0 - lastTail) / (n - 1), minZ: lastTail - 0.01, tilt, calmFrom: lastTail + 1e-6 }, rng);
+  shedFlashing(k, half, zj, Zj, (Z) => yHead + (Z - (lastTail - t.length)) * Math.tan(tilt) + t.thickness / Math.cos(tilt) + 0.002, lastTail);
 
   // Fascia across the front, barge boards along both sides.
   const yF = shedUnder(g, g.zFront);
@@ -1335,96 +1466,290 @@ function buildShedRoof(k: Kit, rng: Rng): void {
   }
 }
 
+/**
+ * The lead where a shed dormer's roof runs in under the main roof: one sheet
+ * dressed over the main roof's tiles from under a course's tails (its upper
+ * edge tucked beneath them) down to the junction, folded there and laid on
+ * down over the shed roof's (calm) top course, its free edge resting on it.
+ * It reaches just into the barge boards on both sides. `shedTop(Z)` is the
+ * top of the shed's top course (shed-frame Y at shed-frame Z), `lastTail`
+ * where that course ends; `zj` / `Zj` the junction (canonical plan z, and
+ * shed-frame Z).
+ */
+function shedFlashing(k: Kit, half: number, zj: number, Zj: number, shedTop: (Z: number) => number, lastTail: number): void {
+  const { g } = k;
+  const tc = k.look.tc;
+  const L = LEAD_SHEET;
+  const M = mainFrame(g);
+  const S = shedFrame(g);
+  const toMain = M.clone().invert();
+  const upM = new THREE.Vector3(0, g.cosP, g.sinP);
+  const upS = new THREE.Vector3(0, g.cD, g.sD);
+  const fold = upM.clone().add(upS).normalize();
+  const xs = [g.xc - half - 0.006, g.xc, g.xc + half + 0.006];
+
+  // Main roof: from under the tails of the course above the junction.
+  const J = mainZ(g, zj);
+  const jt = Math.ceil((tc.tail(0) - (J - 0.05)) / tc.gauge - 1e-9);
+  const tuckTail = tc.tail(jt);
+  const zTop = tuckTail - Math.min(0.09, 0.55 * tc.gauge);
+  // Under that course the sheet lies on the course below it (one tile thickness lower).
+  const step = (x: number) => mainTileTop(k, x, tuckTail) - mainTileTop(k, x, tuckTail + 1e-5);
+  const underMain = (x: number, Z: number) => mainTileTop(k, x, Z) - (Z <= tuckTail ? step(x) : 0) + L.clear;
+  const mainRows = slopeLines(tc, zTop, J, [zTop, zTop + L.taper, tuckTail]).filter((Z) => Z < J - 0.004);
+
+  // Shed roof: from just below the fold to a free edge resting on the top course.
+  const shedPoint = (x: number, Z: number) => new THREE.Vector3(x - g.xc, shedTop(Z) + L.clear, Z).applyMatrix4(S);
+  // The fold: the main-roof side meets the shed side at main-frame Z = J.
+  const foldY = (x: number) => {
+    const a = shedPoint(x, Zj - 0.1).applyMatrix4(toMain);
+    const b = shedPoint(x, Zj + 0.1).applyMatrix4(toMain);
+    const ys = a.y + ((b.y - a.y) * (J - a.z)) / (b.z - a.z || 1);
+    return Math.max(underMain(x, J), ys);
+  };
+  const zEdge = Math.min(Zj + 0.11, lastTail - 0.025);
+  const shedRows = [Zj + 0.025, Zj + 0.025 + (zEdge - L.taper - Zj - 0.025) / 2, zEdge - L.taper, zEdge].filter((Z, i, a) => i === 0 || Z > a[i - 1] + 0.004);
+
+  const rows = mainRows.length + 1 + shedRows.length;
+  const thickAt = (j: number) => (j === 0 || j === rows - 1 ? L.edge : L.body);
+  leadSheet(k, xs.length, rows, (i, j) => {
+    const x = xs[i];
+    const th = thickAt(j);
+    if (j < mainRows.length) {
+      const b = new THREE.Vector3(x, underMain(x, mainRows[j]), mainRows[j]).applyMatrix4(M);
+      return [b, b.clone().addScaledVector(upM, th)];
+    }
+    if (j === mainRows.length) {
+      const b = new THREE.Vector3(x, foldY(x), J).applyMatrix4(M);
+      return [b, b.clone().addScaledVector(fold, th)];
+    }
+    // On the shed roof, but never down among the main roof's tiles next to the fold.
+    let b = shedPoint(x, shedRows[j - mainRows.length - 1]);
+    const q = b.clone().applyMatrix4(toMain);
+    const floor = underMain(x, q.z);
+    if (q.y < floor) b = new THREE.Vector3(x, floor, q.z).applyMatrix4(M);
+    return [b, b.clone().addScaledVector(upS, th)];
+  });
+}
+
 // ---------------------------------------------------------------------------
-// Flashing: apron under the face, step flashing up the cheeks
+// Flashing: a lead collar over the tiles (apron and side strips), cover
+// flashing up the cheeks
 // ---------------------------------------------------------------------------
 
 function buildFlashing(k: Kit): void {
   const { g } = k;
+  const tc = k.look.tc;
   const lead = k.lead;
   const x0 = g.xc - g.hw;
   const x1 = g.xc + g.hw;
-  // Apron: over the tiles in front of the face, and up the face.
-  const apronZ = g.zf + FLASH_APRON * g.cosP;
-  leadOnRoof(k, x0 - FLASH_SIDE, x1 + FLASH_SIDE, g.zf, apronZ, 0.018, 0.006, lead, { x0: true, x1: true, zb: true });
   const fp = g.faceProud;
+
+  // The collar: an apron over the tiles in front of the face and a strip
+  // beside each cheek, one sheet dressed over the real tile tops. Its free
+  // edges rest mid-course; beside a shed dormer it stops a little short of
+  // where the cheeks die into the roof (under the overhang).
+  const E = LEAD_SHEET.taper;
+  const xA = x0 - FLASH_SIDE;
+  const xB = x1 + FLASH_SIDE;
+  const zFace = mainZ(g, g.zf);
+  const zEdge = restingEdge(tc, zFace + FLASH_APRON, zFace + 0.12, zFace + 0.3);
+  const want = mainZ(g, g.cheekEnd + (g.gable ? -0.02 : 0.05));
+  const zTop = restingEdge(tc, want, Math.max(want - 0.06, tc.ridgeLimit + 0.05), Math.min(want + 0.08, zFace - 0.1));
+  const xs = [xA, xA + E, x0, x1, xB - E, xB];
+  const zs = slopeLines(tc, zTop, zEdge, [zTop, zTop + E, zFace, zEdge - E, zEdge]);
+  const thick = (x: number, Z: number) => leadThickness(Math.min(x - xA, xB - x, Z - zTop, zEdge - Z));
+  drapeMain(k, xs, zs, thick, (x, Z) => !(x > x0 && x < x1 && Z < zFace));
+
+  // Upstand up the foot of the face (the stones / cladding start above it).
   const upTop = g.baseY + 0.1;
   put(k, prism(rect(x0 - fp - 0.012, x1 + fp + 0.012, surf(g, g.zf + fp) - 0.03, upTop), g.zf + fp, g.zf + fp + 0.012, 0.004), 'mortar', lead);
 
-  // Beside the cheeks: a strip over the tiles and stepped flashing up the cheek.
+  // Cover flashing up each cheek: lead pieces with a raked top running
+  // parallel to the roof a hand's width over the tiles (the cheeks are
+  // framed or hung, with no bed joints to step into), so from any side they
+  // read as one dressed band, not a row of teeth. Each piece is dressed by
+  // hand: its top a few millimetres higher or lower than its neighbours'.
   for (const s of [-1, 1] as const) {
-    const xa = g.xc + s * g.hw;
-    const xb = xa + s * FLASH_SIDE;
-    leadOnRoof(k, Math.min(xa, xb), Math.max(xa, xb), g.cheekEnd - 0.02, g.zf, 0.018, 0.006, lead, s > 0 ? { x1: true, za: true } : { x0: true, za: true });
     const Ck = cheekFrame(g, s);
     const cp = g.cheekProud;
     const zEnd = g.cheekEnd;
     const zStart = g.zf + fp + 0.012;
-    const steps = Math.max(1, Math.round((zStart - zEnd) / 0.2));
-    for (let i = 0; i < steps; i++) {
-      const za = zStart - ((zStart - zEnd) * i) / steps;
-      const zb = zStart - ((zStart - zEnd) * (i + 1)) / steps;
+    // Under the dormer roof over the flashing's face (cheek-local: z = faceZ - s·u).
+    const ceiling = g.gable
+      ? (poly: V2[]) => clipHalf(poly, 0, 1, g.eaveY - 0.02 - cp * g.tD)
+      : (poly: V2[]) => clipHalf(poly, -s * g.tD, 1, g.ridgeY - (g.zf - g.backZ) * g.tD - 0.02);
+    const pieces = Math.max(1, Math.round((zStart - zEnd) / g.cosP / 0.3));
+    for (let i = 0; i < pieces; i++) {
+      const za = zStart - ((zStart - zEnd) * i) / pieces;
+      const zb = zStart - ((zStart - zEnd) * (i + 1)) / pieces;
       const ua = cheekU(g, s, za);
       const ub = cheekU(g, s, zb);
-      const ceiling = Math.min(cheekTopAt(g, za), cheekTopAt(g, zb)) - 0.02 - cp * (g.gable ? g.tD : 0);
-      const stepTop = Math.min(Math.max(surf(g, za), surf(g, zb)) + 0.085, ceiling);
-      const poly: V2[] = [
+      const h = COVER_UP + k.rng.jitter(0.004);
+      const poly = ceiling([
         [ua, surf(g, za) - 0.03],
         [ub, surf(g, zb) - 0.03],
-        [ub, stepTop],
-        [ua, stepTop],
-      ];
-      if (stepTop - Math.max(surf(g, za), surf(g, zb)) < 0.02) continue;
-      put(k, prism(poly, cp, cp + 0.012, 0.003), 'mortar', lead, Ck);
+        [ub, surf(g, zb) + h],
+        [ua, surf(g, za) + h],
+      ]);
+      if (poly.length < 3 || polyArea(poly) < 0.002) continue;
+      put(k, prism(poly, cp, cp + 0.012 + k.rng.range(0, 0.002), 0.003), 'mortar', lead, Ck);
     }
   }
 }
 
-/** Which edges of a lead sheet are free (dressed down onto the tiles) rather than tucked against something. */
-interface Free {
-  x0?: boolean;
-  x1?: boolean;
-  za?: boolean;
-  zb?: boolean;
+// ---------------------------------------------------------------------------
+// Lead dressed over the main roof's tiles
+// ---------------------------------------------------------------------------
+
+/**
+ * Main-frame slope Z of the main roof's (average) tile surface over
+ * canonical plan z.
+ */
+function mainZ(g: Geo, z: number): number {
+  return z * g.cosP - (surf(g, z) - g.roof.ridgeY) * g.sinP;
 }
 
 /**
- * A lead sheet lying on the main roof over the plan rectangle [x0, x1] ×
- * [za, zb] (canonical): its top `lift` above the tile surface (perpendicular),
- * dressed down to `edgeLift` along its free edges, its bottom under the
- * tiles. Built as a 3 × 3 grid of slabs so every free edge can taper.
+ * Main-frame Y of the top of the main roof's real tiles at canonical x and
+ * main-frame Z. The roof lays the tiles round a dormer's hole calm, exactly
+ * as `tileCourses` describes them.
  */
-function leadOnRoof(k: Kit, x0: number, x1: number, za: number, zb: number, lift: number, edgeLift: number, color: ColorLike, free: Free): void {
-  const { g } = k;
-  if (x1 - x0 < 1e-3 || zb - za < 1e-3) return;
-  const mx = Math.min(0.04, (x1 - x0) / 3);
-  const mz = Math.min(0.04, (zb - za) / 3);
-  const xs = [x0, x0 + mx, x1 - mx, x1];
-  const zs = [za, za + mz, zb - mz, zb];
-  const out = (i: number, j: number) => (i === 0 && free.x0) || (i === 3 && free.x1) || (j === 0 && free.za) || (j === 3 && free.zb);
-  const top = (i: number, j: number) => surf(g, zs[j]) + (out(i, j) ? edgeLift : lift) / g.cosP;
-  // Thin at the dressed edges, so only a sliver of edge shows over the tiles.
-  const below = (i: number, j: number) => surf(g, zs[j]) - (out(i, j) ? 0.014 : 0.035) / g.cosP;
-  const V = (i: number, y: number, j: number) => new THREE.Vector3(xs[i], y, zs[j]);
-  for (let i = 0; i < 3; i++) {
-    for (let j = 0; j < 3; j++) {
-      put(
-        k,
-        hexahedron([
-          V(i, below(i, j), j),
-          V(i + 1, below(i + 1, j), j),
-          V(i + 1, below(i + 1, j + 1), j + 1),
-          V(i, below(i, j + 1), j + 1),
-          V(i, top(i, j), j),
-          V(i + 1, top(i + 1, j), j),
-          V(i + 1, top(i + 1, j + 1), j + 1),
-          V(i, top(i, j + 1), j + 1),
-        ]),
-        'mortar',
-        color,
-      );
+function mainTileTop(k: Kit, x: number, Z: number): number {
+  const tc = k.look.tc;
+  return tc.topAt(x - k.g.d.sign * tc.cx, Z);
+}
+
+/** Lead thickness at distance d from a free edge (thin where it is dressed down). */
+function leadThickness(d: number): number {
+  const L = LEAD_SHEET;
+  const t = clamp(d / L.taper, 0, 1);
+  return L.edge + (L.body - L.edge) * t * t * (3 - 2 * t);
+}
+
+/**
+ * A free lead edge near `want` (main-frame Z, kept within [lo, hi]) that rests
+ * on the middle of a course's exposed tiles, clear of the step where the
+ * course above ends, so it lies on the tiles instead of hanging over a step.
+ */
+function restingEdge(tc: TileCourses, want: number, lo: number, hi: number): number {
+  let best = clamp(want, lo, hi);
+  let bestD = Infinity;
+  for (let j = 0; j < tc.courses; j++) {
+    const T = tc.tail(j);
+    const a = Math.max(lo, T - tc.gauge + LEAD_SHEET.ramp + 0.015);
+    const c = Math.min(hi, T - 0.03);
+    if (c < a) continue;
+    const z = clamp(want, a, c);
+    if (Math.abs(z - want) < bestD) {
+      bestD = Math.abs(z - want);
+      best = z;
     }
   }
+  return best;
+}
+
+/**
+ * Grid lines down the slope (main-frame Z) for a sheet over [z0, z1]: the
+ * given breaks plus every course's tail line (the sheet steps down there)
+ * and the foot of the ramp below it. Tail lines are kept exact; other lines
+ * closer than 3 mm to a line already taken are dropped.
+ */
+function slopeLines(tc: TileCourses, z0: number, z1: number, breaks: number[]): number[] {
+  const tails: number[] = [];
+  const rest: number[] = breaks.filter((z) => z >= z0 - 1e-9 && z <= z1 + 1e-9);
+  for (let j = 0; j < tc.courses; j++) {
+    const T = tc.tail(j);
+    if (T > z0 + 1e-6 && T < z1 - 1e-6) tails.push(T);
+    if (T + LEAD_SHEET.ramp > z0 + 1e-6 && T + LEAD_SHEET.ramp < z1 - 1e-6) rest.push(T + LEAD_SHEET.ramp);
+  }
+  const ends = [z0, z1];
+  const out = [...ends, ...tails];
+  for (const z of rest.sort((a, b) => a - b)) {
+    if (out.every((o) => Math.abs(o - z) >= 0.003)) out.push(z);
+  }
+  return out.sort((a, b) => a - b).filter((z, i, a) => i === 0 || z - a[i - 1] > 1e-7);
+}
+
+/**
+ * A sheet of lead draped over the main roof's tiles: columns at canonical
+ * x = xs, rows at main-frame Z = zs (both ascending). Its underside lies a
+ * few millimetres over the tile tops, `thick(x, Z)` is the lead's
+ * thickness, and only cells whose centre is `filled` are built.
+ */
+function drapeMain(k: Kit, xs: number[], zs: number[], thick: (x: number, Z: number) => number, filled?: (x: number, Z: number) => boolean): void {
+  const M = mainFrame(k.g);
+  const up = new THREE.Vector3(0, k.g.cosP, k.g.sinP);
+  leadSheet(
+    k,
+    xs.length,
+    zs.length,
+    (i, j) => {
+      const x = xs[i];
+      const Z = zs[j];
+      const b = new THREE.Vector3(x, mainTileTop(k, x, Z) + LEAD_SHEET.clear, Z).applyMatrix4(M);
+      return [b, b.clone().addScaledVector(up, thick(x, Z))];
+    },
+    filled ? (i, j) => filled((xs[i] + xs[i + 1]) / 2, (zs[j] + zs[j + 1]) / 2) : undefined,
+  );
+}
+
+/**
+ * A lead sheet from a grid of canonical points: `at(i, j)` gives the
+ * underside and the top of the sheet at column i, row j. Builds the top of
+ * every filled cell and the rim round the filled region (the underside lies
+ * on the roof and never shows); flat-shaded like dressed metal.
+ */
+function leadSheet(
+  k: Kit,
+  nx: number,
+  nz: number,
+  at: (i: number, j: number) => [THREE.Vector3, THREE.Vector3],
+  filled: (i: number, j: number) => boolean = () => true,
+): void {
+  const bot: THREE.Vector3[][] = [];
+  const top: THREE.Vector3[][] = [];
+  for (let i = 0; i < nx; i++) {
+    bot.push([]);
+    top.push([]);
+    for (let j = 0; j < nz; j++) {
+      const [b, t] = at(i, j);
+      bot[i].push(b);
+      top[i].push(t);
+    }
+  }
+  const has = (i: number, j: number) => i >= 0 && j >= 0 && i < nx - 1 && j < nz - 1 && filled(i, j);
+  const pos: number[] = [];
+  const centre = new THREE.Vector3();
+  const e1 = new THREE.Vector3();
+  const e2 = new THREE.Vector3();
+  const mid = new THREE.Vector3();
+  // A quad as two triangles, facing away from the cell's centre.
+  const quad = (q: THREE.Vector3[]) => {
+    e1.subVectors(q[1], q[0]);
+    e2.subVectors(q[2], q[0]);
+    mid.copy(q[0]).add(q[1]).add(q[2]).add(q[3]).multiplyScalar(0.25).sub(centre);
+    const order = e1.cross(e2).dot(mid) >= 0 ? [0, 1, 2, 0, 2, 3] : [0, 2, 1, 0, 3, 2];
+    for (const o of order) pos.push(q[o].x, q[o].y, q[o].z);
+  };
+  for (let i = 0; i + 1 < nx; i++) {
+    for (let j = 0; j + 1 < nz; j++) {
+      if (!has(i, j)) continue;
+      centre.set(0, 0, 0);
+      for (const p of [bot[i][j], bot[i + 1][j], bot[i + 1][j + 1], bot[i][j + 1], top[i][j], top[i + 1][j], top[i + 1][j + 1], top[i][j + 1]]) centre.add(p);
+      centre.multiplyScalar(1 / 8);
+      quad([top[i][j], top[i + 1][j], top[i + 1][j + 1], top[i][j + 1]]);
+      if (!has(i, j - 1)) quad([top[i][j], top[i + 1][j], bot[i + 1][j], bot[i][j]]);
+      if (!has(i, j + 1)) quad([top[i][j + 1], top[i + 1][j + 1], bot[i + 1][j + 1], bot[i][j + 1]]);
+      if (!has(i - 1, j)) quad([top[i][j], top[i][j + 1], bot[i][j + 1], bot[i][j]]);
+      if (!has(i + 1, j)) quad([top[i + 1][j], top[i + 1][j + 1], bot[i + 1][j + 1], bot[i + 1][j]]);
+    }
+  }
+  if (!pos.length) return;
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geom.computeVertexNormals();
+  put(k, geom, 'mortar', k.lead);
 }
 
 // ---------------------------------------------------------------------------
@@ -1441,6 +1766,8 @@ interface CourseOpts {
   tilt?: number;
   /** Hung on a wall: no tile ever shows its back. */
   hung?: boolean;
+  /** Courses whose tail is above (less than) this Z are laid calm, without hand-laid jitter (lead lies on them). */
+  calmFrom?: number;
 }
 
 /**
@@ -1471,8 +1798,11 @@ function layTiles(k: Kit, frame: THREE.Matrix4, region: V2[], t: TileSpec, yHead
       const w = x1 - x0;
       if (w < 0.02) continue;
       const xc = (x0 + x1) / 2;
-      const len = t.length * (1 + rng.jitter(0.02));
-      const tl = tail + rng.jitter(0.006);
+      // (The jitter is always drawn, so laying a course calm leaves the rest of the roof as it is.)
+      const calm = o.calmFrom !== undefined && tail < o.calmFrom;
+      const jit = [rng.jitter(0.02), rng.jitter(0.006), rng.jitter(0.008), rng.jitter(0.02), rng.jitter(0.012)].map((v) => (calm ? 0 : v));
+      const len = t.length * (1 + jit[0]);
+      const tl = tail + jit[1];
       const head = tl - len;
       const outline = tileOutline(t.kind, w, len, rng);
       const foot = clipConvex(outline.map(([x, z]) => [x + xc, z + head] as V2), region);
@@ -1482,7 +1812,7 @@ function layTiles(k: Kit, frame: THREE.Matrix4, region: V2[], t: TileSpec, yHead
       // Only the lowest course can show its underside (and never on a wall).
       const mesh = tileMesh(t.kind, foot.map(([x, z]) => [x - xc, z - head] as V2), len, t.thickness, j === 0 && !o.hung);
       if (!mesh) continue;
-      const m = mul(frame, rot(xc, yHead, head, -tilt + rng.jitter(0.008), rng.jitter(0.02), rng.jitter(0.012)));
+      const m = mul(frame, rot(xc, yHead, head, -tilt + jit[2], jit[3], jit[4]));
       k.tiles.add(mesh, m, k.look.tiles.pick(rng));
     }
   }
@@ -1893,35 +2223,6 @@ function prismX(profile: V2[], x0: number, x1: number, chamfer: number): THREE.B
   );
   if (!g) return null;
   return g.applyMatrix4(new THREE.Matrix4().makeBasis(new THREE.Vector3(0, 0, -1), new THREE.Vector3(0, 1, 0), new THREE.Vector3(1, 0, 0)));
-}
-
-/** Closed hexahedron from 8 corners (bottom 4, then top 4, same order), flat-shaded. */
-function hexahedron(v: THREE.Vector3[]): THREE.BufferGeometry {
-  const faces = [
-    [0, 1, 2, 3],
-    [4, 7, 6, 5],
-    [0, 4, 5, 1],
-    [1, 5, 6, 2],
-    [2, 6, 7, 3],
-    [3, 7, 4, 0],
-  ];
-  const centre = v.reduce((a, b) => a.clone().add(b), new THREE.Vector3()).multiplyScalar(1 / 8);
-  const pos: number[] = [];
-  for (const [a, b, c, d] of faces) {
-    for (const [p, q, r] of [
-      [a, b, c],
-      [a, c, d],
-    ]) {
-      const n = v[q].clone().sub(v[p]).cross(v[r].clone().sub(v[p]));
-      const mid = v[p].clone().add(v[q]).add(v[r]).multiplyScalar(1 / 3);
-      const order = n.dot(mid.sub(centre)) >= 0 ? [p, q, r] : [p, r, q];
-      for (const i of order) pos.push(v[i].x, v[i].y, v[i].z);
-    }
-  }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  g.computeVertexNormals();
-  return g;
 }
 
 /** A colour with its HSL lightness shifted by dl. */
