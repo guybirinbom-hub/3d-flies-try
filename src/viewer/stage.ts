@@ -18,7 +18,17 @@ export class Stage {
   private composer: EffectComposer;
   private aoPass: GTAOPass;
   private ground: THREE.Mesh;
-  ao = true;
+  private _ao = true;
+  /** Set whenever something visible changed; the viewer only draws when it is. */
+  dirty = true;
+
+  get ao(): boolean {
+    return this._ao;
+  }
+  set ao(on: boolean) {
+    this._ao = on;
+    this.dirty = true;
+  }
 
   constructor(container: HTMLElement, opts: { preserveDrawingBuffer?: boolean } = {}) {
     this.renderer = new THREE.WebGLRenderer({
@@ -28,7 +38,8 @@ export class Stage {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(container.clientWidth, container.clientHeight);
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // Plain PCF honours shadow.radius (PCFSoft ignores it): soft, painterly edges.
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.toneMapping = THREE.NeutralToneMapping;
     this.renderer.toneMappingExposure = 1.0;
     container.appendChild(this.renderer.domElement);
@@ -51,7 +62,7 @@ export class Stage {
     this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     this.scene.environmentIntensity = 0.35;
 
-    const hemi = new THREE.HemisphereLight('#d6e6ff', '#8a8f5a', 1.25);
+    const hemi = new THREE.HemisphereLight('#d6e6ff', '#7f8a6c', 1.25);
     this.scene.add(hemi);
 
     this.sun = new THREE.DirectionalLight('#fff0d8', 2.7);
@@ -60,7 +71,7 @@ export class Stage {
     this.sun.shadow.mapSize.set(4096, 4096);
     this.sun.shadow.bias = -0.0004;
     this.sun.shadow.normalBias = 0.025;
-    this.sun.shadow.radius = 3;
+    this.sun.shadow.radius = 4;
     this.scene.add(this.sun, this.sun.target);
 
     this.ground = makeGround();
@@ -89,6 +100,7 @@ export class Stage {
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
     this.composer.setSize(w, h);
+    this.dirty = true;
   }
 
   /** Fit the sun's shadow camera around a box. */
@@ -103,7 +115,10 @@ export class Stage {
     cam.near = 0.5;
     cam.far = r * 4;
     this.sun.target.position.copy(c);
-    this.sun.position.copy(c).add(new THREE.Vector3(0.55, 0.85, 0.65).normalize().multiplyScalar(r * 2));
+    // Afternoon sun from the front-left: the front and left gable are lit,
+    // the right gable (seen in the default view) is in shade and the house
+    // casts its shadow to the right and back.
+    this.sun.position.copy(c).add(SUN_DIR.clone().multiplyScalar(r * 2));
     cam.updateProjectionMatrix();
     this.sun.shadow.needsUpdate = true;
   }
@@ -117,10 +132,18 @@ export class Stage {
 
   render(): void {
     this.controls.update();
-    if (this.ao) this.composer.render();
+    this.draw();
+  }
+
+  /** Draw a frame without stepping the controls. */
+  draw(): void {
+    if (this._ao) this.composer.render();
     else this.renderer.render(this.scene, this.camera);
+    this.dirty = false;
   }
 }
+
+const SUN_DIR = new THREE.Vector3(-0.6, 0.82, 0.55).normalize();
 
 /** Pale warm haze at the horizon (fog and the bottom of the sky). */
 const HAZE = '#e2e8dc';

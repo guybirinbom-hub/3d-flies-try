@@ -132,6 +132,7 @@ async function rebuild(): Promise<void> {
 
 function applyVisibility(): void {
   for (const h of houses) for (const part of h.group.children) part.visible = !hidden.has(part.name);
+  stage.dirty = true;
 }
 
 function setLayerVisible(name: string, on: boolean): void {
@@ -141,6 +142,7 @@ function setLayerVisible(name: string, on: boolean): void {
 }
 
 function applyExplode(): void {
+  stage.dirty = true;
   for (const h of houses) {
     for (const part of h.group.children) {
       for (const o of [part, ...part.children]) {
@@ -169,6 +171,7 @@ function setCamera(preset: CameraPreset, explode = 0): void {
     stage.controls.target.copy(target);
   }
   stage.controls.update();
+  stage.dirty = true;
   // Haze scales with how far away we look from.
   const dist = stage.camera.position.distanceTo(stage.controls.target);
   stage.setFogRange(Math.max(60, dist * 1.8), Math.max(190, dist * 5.5));
@@ -274,15 +277,21 @@ stage.observeResize(container);
 
 // Headless shots (ui=0) render on demand only: software WebGL is slow and a
 // continuous loop would just queue frames nobody looks at.
+// Live view draws only when something changed (orbiting, damping, a
+// rebuild, the assembly animation, the turntable), so an idle page is idle.
+stage.controls.addEventListener('change', () => (stage.dirty = true));
+for (const ev of ['input', 'change', 'click']) document.getElementById('sheet')?.addEventListener(ev, () => (stage.dirty = true));
 function loop(): void {
   stage.controls.autoRotate = state.autoRotate;
   if (followExplode && houses.length === 1) {
     const { position, target } = cameraFor(lastPreset, houses[0].layout, stage.camera.fov, stage.camera.aspect, state.explode);
     stage.camera.position.copy(position);
     stage.controls.target.copy(target);
+    stage.dirty = true;
     if (state.explode <= 0) followExplode = false;
   }
-  stage.render();
+  const moved = stage.controls.update();
+  if (moved || stage.dirty || state.autoRotate) stage.draw();
   requestAnimationFrame(loop);
 }
 if (live) {

@@ -27,17 +27,26 @@ export const part: PartDef = {
       const storey = layout.storeys[wall.storey];
       const color = tones[wall.storey];
       const mat = wall.style === 'stone' ? 'mortar' : 'plaster';
-      b.add(slab(wallShape(wall), wall.thickness), mat, color, wall.frame);
+      // Plaster storeys have no quoins or corner posts, so their corners are
+      // rounded: the front/back walls (which own the corners) stop short by
+      // CORNER_R and a quarter-round plus a filler block close each corner.
+      const rounded = wall.style === 'plaster' && !wall.isGable;
+      const body = rounded ? { ...wall, u0: CORNER_R, u1: wall.length - CORNER_R } : wall;
+      b.add(slab(wallShape(body), wall.thickness), mat, color, wall.frame);
       if (wall.storey === layout.storeys.length - 1 && !wall.isGable) {
         b.add(eaveWedge(wall, Math.tan(layout.roof.pitch)), mat, color, wall.frame);
       }
-      // Plaster storeys have no quoins or corner posts: soften the arris
-      // where this wall ends (each wall owns the corner at its end).
-      if (wall.style === 'plaster') {
-        // Centred just inside the arris so it bulges ~1 cm past both faces.
-        const bead = new THREE.CylinderGeometry(CORNER_R, CORNER_R, wall.y1 - storey.y0, 10);
-        const c = CORNER_R * 0.7;
-        b.add(bead, 'plaster', color, mul(wall.frame, mat4(wall.length - c, (storey.y0 + wall.y1) / 2, -c)));
+      if (rounded) {
+        const h = wall.y1 - storey.y0;
+        const yc = (storey.y0 + wall.y1) / 2;
+        for (const end of [0, 1]) {
+          const u = end ? wall.length - CORNER_R : CORNER_R;
+          const round = new THREE.CylinderGeometry(CORNER_R, CORNER_R, h, 12);
+          b.add(round, mat, color, mul(wall.frame, mat4(u, yc, -CORNER_R)));
+          const fill = new THREE.BoxGeometry(CORNER_R, h, wall.thickness - CORNER_R);
+          const uf = end ? wall.length - CORNER_R / 2 : CORNER_R / 2;
+          b.add(fill, mat, color, mul(wall.frame, mat4(uf, yc, -(wall.thickness + CORNER_R) / 2)));
+        }
       }
       out.push(b);
     }
@@ -45,8 +54,8 @@ export const part: PartDef = {
   },
 };
 
-/** Radius of the rounded plaster arris at the corners of plaster storeys. */
-const CORNER_R = 0.035;
+/** Radius of the rounded arris at the corners of plaster storeys. */
+const CORNER_R = 0.06;
 
 /**
  * Extrude a wall outline (in wall-local u, y) by `depth` towards -w.

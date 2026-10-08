@@ -68,7 +68,7 @@ export function villageDressing(
   // Lanes: gentle curves from each house's door to the well.
   places.forEach((p, i) => {
     const start = doorFront(layouts[i], p);
-    const end = new THREE.Vector3(wellAt.x, 0, wellAt.y).add(start.clone().setY(0).normalize().multiplyScalar(1.4));
+    const end = new THREE.Vector3(wellAt.x, 0, wellAt.y).add(start.clone().setY(0).normalize().multiplyScalar(1.9));
     lane(b, start, end, rng.fork(`lane${i}`));
   });
 
@@ -119,44 +119,80 @@ function tree(b: PartBuilder, x: number, z: number, rng: Rng): void {
   }
 }
 
-/** Stone well with a little tiled roof on two posts. */
+/** Stone well with a windlass under a little tiled roof on two posts. */
 function well(b: PartBuilder, x: number, z: number, rng: Rng): void {
   const stones = 12;
+  const ringR = 0.72;
   for (let ring = 0; ring < 3; ring++) {
     for (let i = 0; i < stones; i++) {
       const a = ((i + (ring % 2) * 0.5) / stones) * Math.PI * 2;
       const g = lumpify(new THREE.BoxGeometry(0.42, 0.22, 0.26, 2, 1, 1), 0.012, i * 7 + ring);
-      b.add(g, 'stone', vary('#b9ad9a', rng, 0.07, 0.04), mat4(x + Math.cos(a) * 0.72, 0.11 + ring * 0.23, z + Math.sin(a) * 0.72, 0, -a + Math.PI / 2, 0));
+      b.add(g, 'stone', vary('#b9ad9a', rng, 0.07, 0.04), mat4(x + Math.cos(a) * ringR, 0.11 + ring * 0.23, z + Math.sin(a) * ringR, 0, -a + Math.PI / 2, 0));
     }
   }
-  b.add(new THREE.CylinderGeometry(0.62, 0.62, 0.05, 20), 'glass', '#1d2b33', mat4(x, 0.55, z));
-  for (const s of [-1, 1]) b.box('timber', vary('#5a4331', rng), 0.12, 2.0, 0.12, mat4(x + s * 0.8, 1.0, z), 0.02);
-  b.box('timber', '#5a4331', 1.8, 0.1, 0.1, mat4(x, 1.85, z), 0.02);
+  b.add(new THREE.CylinderGeometry(0.6, 0.6, 0.05, 20), 'glass', '#1d2b33', mat4(x, 0.55, z));
+  // Posts stand outside the stone ring on their own footing stones.
+  const postX = ringR + 0.13 + 0.08;
+  const timber = vary('#5a4331', rng);
   for (const s of [-1, 1]) {
-    b.box('roof', vary('#a65d3f', rng, 0.04), 2.1, 0.06, 0.85, mat4(x, 2.12, z + s * 0.32, s * 0.65, 0, 0), 0.02);
+    b.box('stone', vary('#a99d8a', rng, 0.05), 0.24, 0.12, 0.24, mat4(x + s * postX, 0.06, z), 0.03);
+    b.box('timber', timber, 0.12, 2.0, 0.12, mat4(x + s * postX, 1.1, z), 0.02);
   }
-  b.add(new THREE.CylinderGeometry(0.12, 0.1, 0.18, 10), 'wood', '#7b5636', mat4(x + 0.1, 1.3, z));
+  b.box('timber', timber, 2 * postX + 0.2, 0.1, 0.1, mat4(x, 2.05, z), 0.02);
+  for (const s of [-1, 1]) {
+    b.box('roof', vary('#a65d3f', rng, 0.04), 2 * postX + 0.5, 0.06, 0.85, mat4(x, 2.32, z + s * 0.32, s * 0.65, 0, 0), 0.02);
+  }
+  // Windlass: axle between the posts with a crank, rope down to the bucket.
+  const axleY = 1.45;
+  b.add(new THREE.CylinderGeometry(0.06, 0.06, 2 * postX - 0.12, 10), 'wood', '#7b5636', mat4(x, axleY, z, 0, 0, Math.PI / 2));
+  b.add(new THREE.CylinderGeometry(0.085, 0.085, 0.3, 12), 'wood', '#6d4c30', mat4(x, axleY, z, 0, 0, Math.PI / 2));
+  b.box('metal', '#3b3735', 0.03, 0.22, 0.03, mat4(x + postX + 0.08, axleY - 0.1, z), 0.01);
+  b.box('metal', '#3b3735', 0.14, 0.03, 0.03, mat4(x + postX + 0.14, axleY - 0.2, z), 0.01);
+  b.add(new THREE.CylinderGeometry(0.012, 0.012, 0.42, 6), 'wood', '#c9b27c', mat4(x, axleY - 0.29, z + 0.07));
+  b.add(new THREE.CylinderGeometry(0.12, 0.1, 0.18, 12), 'wood', '#7b5636', mat4(x, axleY - 0.59, z + 0.07));
+  b.add(new THREE.TorusGeometry(0.11, 0.008, 4, 16), 'metal', '#3b3735', mat4(x, axleY - 0.52, z + 0.07, Math.PI / 2, 0, 0));
+  // Gravel apron round the well where the lanes arrive.
+  b.add(new THREE.CircleGeometry(2.1, 28).rotateX(-Math.PI / 2), 'stone', '#b9ab8f', mat4(x, 0.008, z), (p, _n, out) => {
+    const k = Math.sin(p.x * 3.1) * Math.cos(p.z * 2.7) * 0.5 + 0.5;
+    out.offsetHSL(0, -0.02, (k - 0.5) * 0.06);
+  });
 }
 
-/** A soft gravel lane (flat ribbon just above the grass). */
+/** A soft gravel lane: one continuous ribbon (shared edges, no gaps at bends). */
 function lane(b: PartBuilder, from: THREE.Vector3, to: THREE.Vector3, rng: Rng): void {
   const mid = from.clone().lerp(to, 0.5).add(new THREE.Vector3(rng.jitter(2), 0, rng.jitter(2)));
-  const curve = new THREE.QuadraticBezierCurve3(from, mid, to);
-  const pts = curve.getPoints(24);
-  const positions: number[] = [];
+  const pts = new THREE.QuadraticBezierCurve3(from, mid, to).getPoints(28);
   const width = rng.range(0.9, 1.2);
-  for (let i = 0; i < pts.length - 1; i++) {
-    const a = pts[i];
-    const c = pts[i + 1];
-    const dir = c.clone().sub(a).normalize();
+  const left: THREE.Vector3[] = [];
+  const right: THREE.Vector3[] = [];
+  pts.forEach((p, i) => {
+    // One side vector per point, averaged over the segments meeting there.
+    const a = pts[Math.max(0, i - 1)];
+    const c = pts[Math.min(pts.length - 1, i + 1)];
+    const dir = c.clone().sub(a).setY(0).normalize();
     const side = new THREE.Vector3(-dir.z, 0, dir.x).multiplyScalar(width / 2);
-    const y = 0.012;
-    const p = [a.clone().add(side), a.clone().sub(side), c.clone().add(side), c.clone().sub(side)].map((v) => v.setY(y));
-    positions.push(...p[0].toArray(), ...p[2].toArray(), ...p[1].toArray(), ...p[1].toArray(), ...p[2].toArray(), ...p[3].toArray());
+    left.push(p.clone().add(side).setY(0.011));
+    right.push(p.clone().sub(side).setY(0.011));
+  });
+  const positions: number[] = [];
+  for (let i = 0; i + 1 < pts.length; i++) {
+    positions.push(...left[i].toArray(), ...left[i + 1].toArray(), ...right[i].toArray());
+    positions.push(...right[i].toArray(), ...left[i + 1].toArray(), ...right[i + 1].toArray());
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   g.computeVertexNormals();
+  // Normals must point up whatever the winding came out as.
+  const n = g.attributes.normal as THREE.BufferAttribute;
+  if (n.getY(0) < 0) {
+    const pos = g.attributes.position as THREE.BufferAttribute;
+    for (let i = 0; i < pos.count; i += 3) {
+      const t = [pos.getX(i + 1), pos.getY(i + 1), pos.getZ(i + 1)];
+      pos.setXYZ(i + 1, pos.getX(i + 2), pos.getY(i + 2), pos.getZ(i + 2));
+      pos.setXYZ(i + 2, t[0], t[1], t[2]);
+    }
+    g.computeVertexNormals();
+  }
   b.add(g, 'stone', '#b9ab8f', undefined, (p, _n, out) => {
     const k = Math.sin(p.x * 3.1) * Math.cos(p.z * 2.7) * 0.5 + 0.5;
     out.offsetHSL(0, -0.02, (k - 0.5) * 0.06);

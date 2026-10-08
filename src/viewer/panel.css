@@ -402,6 +402,19 @@ input[type='range'] {
   }
   .views button {
     flex: none;
+    min-height: 36px;
+  }
+  .views {
+    mask-image: linear-gradient(to right, #000 85%, transparent);
+  }
+  .grabber {
+    min-height: 40px;
+  }
+  .switch {
+    min-height: 40px;
+  }
+  input[type='range'] {
+    min-height: 32px;
   }
 }
 
@@ -427,4 +440,15 @@ input[type='range']:disabled {
 }
 .sheet.busy .sheet-foot span:last-child {
   color: var(--moss);
+}
+
+.house-controls.muted {
+  opacity: 0.45;
+}
+.village-note {
+  margin-block: 12px 4px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--well);
+  color: var(--ink);
 }

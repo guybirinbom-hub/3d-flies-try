@@ -101,8 +101,21 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
 
   // ----- body: parameter sections ------------------------------------------
   const body = el('div', 'sheet-body');
+  // Village mode generates its own houses from consecutive seeds, so the
+  // single-house controls step aside (and say why).
+  const houseControls = el('div', 'house-controls');
+  const villageNote = hint('');
+  villageNote.classList.add('village-note');
+  updaters.push(() => {
+    const village = d.state.gallery > 0;
+    houseControls.inert = village;
+    houseControls.classList.toggle('muted', village);
+    villageNote.hidden = !village;
+    villageNote.textContent = `The village shows nine houses from seeds ${p().seed}–${p().seed + 8}. Use New house or the seed arrows to see another village; turn the village off to shape a single house.`;
+    viewsBar.hidden = village;
+  });
 
-  body.append(
+  houseControls.append(
     section('Footprint', true, [
       rangeParam('Length', 'width', 5, 14, 0.1, 'm'),
       rangeParam('Depth', 'depth', 4, 8, 0.1, 'm'),
@@ -152,6 +165,10 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
       ),
     ]),
     section('Colour & surroundings', false, [paletteField(), switches([['Garden props', 'props']])]),
+  );
+  body.append(
+    villageNote,
+    houseControls,
     section('Layers', false, [
       hint('Each layer is a separate generator reading the same plan. Hide some to see how the house is put together.'),
       layerSwitches(),
@@ -161,7 +178,7 @@ export function createPanel(sheet: HTMLElement, viewsBar: HTMLElement, readout: 
         ['Village of nine', () => d.state.gallery > 0, async (v) => {
           d.state.gallery = v ? 9 : 0;
           setBusy(true);
-          refreshReadout();
+          refresh();
           await d.rebuild();
           d.setCamera('iso');
           setBusy(false);

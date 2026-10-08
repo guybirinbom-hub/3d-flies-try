@@ -33,6 +33,7 @@ try {
     ['desktop-light', { width: 1360, height: 860 }, 'light'],
     ['desktop-dark', { width: 1360, height: 860 }, 'dark'],
     ['phone-light', { width: 400, height: 820 }, 'light'],
+    ['phone-dark', { width: 400, height: 820 }, 'dark'],
   ]) {
     const page = await browser.newPage({ viewport: vp, colorScheme: scheme });
     const problems = [];
@@ -41,7 +42,7 @@ try {
     await page.goto(base, { waitUntil: 'load', timeout: 120000 });
     await page.waitForFunction(() => window.__app && window.__app.ready, null, { timeout: 120000 });
     await page.waitForTimeout(3000);
-    await page.screenshot({ path: join(out, `${name}.png`) });
+    await page.screenshot({ path: join(out, `${name}.png`), timeout: 300000 });
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
     console.log(`✓ ${name}${overflow ? ' (HORIZONTAL OVERFLOW)' : ''}${problems.length ? ' errors: ' + problems.join(' | ') : ''}`);
     await page.close();
