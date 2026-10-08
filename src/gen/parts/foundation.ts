@@ -15,8 +15,11 @@ import type { Rng } from '../rng';
  * every corner one block turns the corner, and which wall carries its long
  * side alternates from course to course (like quoins), so the band wraps the
  * house the way real masonry does. The top course has a weathered top that
- * sheds water away from the wall. A mortar bed behind the blocks fills the
- * joints whatever the wall style is.
+ * sheds water away from the wall. A low plinth (≲ 0.3 m) becomes a chamfered
+ * base course: buried deeper so it rises straight out of the ground, a crisp
+ * straight weathering, long dressed lengths (in quoin-like dressed stone
+ * under stone walls), so it reads as the foot of the wall, not a kerb. A
+ * mortar bed behind the blocks fills the joints whatever the wall style is.
  *
  * The steps are big slabs stacked like a small pyramid inside `layout.stoop`:
  * each one sits on (and is embedded in) the one below, lower steps wider and
@@ -134,7 +137,11 @@ function buildPlinth(layout: HouseLayout, rng: Rng, slabs: StepSlab[]): PartBuil
   const ground = layout.storeys[0];
   const walls = ground.walls;
   const pal = layout.params.palette;
-  const base = mix(pal.stone, '#4f4a44', 0.32);
+  // A darker, heavier stone than the walls; a low base course under stone
+  // walls is dressed like the quoins (lighter), so it reads as part of the
+  // masonry rather than an edging laid along the grass.
+  const dressed = ground.style === 'stone' ? lowness(ground.floorY) * 0.6 : 0;
+  const base = mix(mix(pal.stone, '#4f4a44', 0.32), mix(pal.stone, '#efe4cf', 0.1), dressed);
   const courses = planCourses(ground.floorY, ground.style, [...new Set(slabs.map((s) => s.y1))]);
   const corners = courses.map((c) => planCorners(c, walls, rng));
   // On the door wall, keep joints off the sides of the step slabs too.
@@ -309,11 +316,12 @@ function addBlock(
   if (course.isTop) {
     const P = course.front;
     const pos = g.attributes.position as THREE.BufferAttribute;
+    // 0 where the slope starts (just in front of the wall), 1 at the band's front.
+    const run = (v: number) => clamp((v - course.slopeFrom) / (P - course.slopeFrom), 0, 1);
     for (let i = 0; i < pos.count; i++) {
       const u = pos.getX(i);
       const y = pos.getY(i);
       const w = pos.getZ(i);
-      const run = (v: number) => clamp((v - course.slopeFrom) / (P - course.slopeFrom), 0, 1);
       const out = Math.max(run(w), overNeighbour ? run(overNeighbour(u) * P) : 0);
       const up = clamp((y - c.y) / (sy / 2), 0, 1);
       const profile = smooth(out) + (out - smooth(out)) * course.chamfer;

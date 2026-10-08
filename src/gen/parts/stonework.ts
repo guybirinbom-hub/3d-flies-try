@@ -24,7 +24,10 @@ import type { Rng } from '../rng';
  *    with stones of varied length that butt exactly against them.
  * 5. Every stone is squeezed under the roof: its vertices are pulled below
  *    the gable edge / soffit plane, so nothing pokes through the roof deck.
- *    Under a jetty the top of the eave walls is left to the timber joist ends.
+ *    Under a jetty the top of the walls (the joist layer) gets a thin course:
+ *    small packing stones between the timber joist ends on the eave walls,
+ *    a levelling course between the corner joists on the gables.
+ * 6. Big houses (low `layout.detail`) get fewer, larger stones (Lod).
  */
 export const part: PartDef = {
   name: 'stonework',
@@ -32,9 +35,19 @@ export const part: PartDef = {
   explode: [0, 0, 0],
   build: ({ layout, rng }) => {
     const lod = stoneLod(layout);
-    return layout.storeys
-      .filter((storey) => storey.style === 'stone')
-      .flatMap((storey) => buildStorey(layout, storey, lod, rng.fork(`storey${storey.index}`)));
+    const out: PartBuilder[] = [];
+    // Quoins keep alternating from one stone storey into the next.
+    let below: boolean[] | null = null;
+    for (const storey of layout.storeys) {
+      if (storey.style !== 'stone') {
+        below = null;
+        continue;
+      }
+      const built = buildStorey(layout, storey, lod, below, rng.fork(`storey${storey.index}`));
+      out.push(...built.builders);
+      below = built.topLongA;
+    }
+    return out;
   },
 };
 
@@ -110,6 +123,8 @@ interface Piece extends Rect {
 interface Quoin extends Band {
   alongA: number;
   alongB: number;
+  /** Planned long along A (before any trimming for openings). */
+  longA: boolean;
 }
 
 /**
@@ -154,7 +169,18 @@ interface WallJob {
 // Storey
 // ---------------------------------------------------------------------------
 
-function buildStorey(layout: HouseLayout, storey: StoreySpec, lod: Lod, rng: Rng): PartBuilder[] {
+/**
+ * Lay one stone storey. `below` says, per corner, whether the top quoin of
+ * the stone storey underneath runs long along wall A (null: none below).
+ * Returns the builders and the same for this storey's top quoins.
+ */
+function buildStorey(
+  layout: HouseLayout,
+  storey: StoreySpec,
+  lod: Lod,
+  below: boolean[] | null,
+  rng: Rng,
+): { builders: PartBuilder[]; topLongA: boolean[] } {
   const pal = layout.params.palette;
   const isTop = storey.index === layout.storeys.length - 1;
   const walls = storey.walls;
@@ -167,7 +193,9 @@ function buildStorey(layout: HouseLayout, storey: StoreySpec, lod: Lod, rng: Rng
 
   const bands = quoinBands(yStart, yEnd, walls.flatMap(openingLines), lod.scale, rng.fork('bands'));
   // corners[i] sits at the END of walls[i] = the START of walls[i + 1].
-  const corners = walls.map((wall, i) => planCorner(wall, walls[(i + 1) % 4], bands, lod.scale, rng.fork(`corner${i}`)));
+  const corners = walls.map((wall, i) =>
+    planCorner(wall, walls[(i + 1) % 4], bands, lod.scale, below ? !below[i] : null, rng.fork(`corner${i}`)),
+  );
 
   const out: PartBuilder[] = [];
   walls.forEach((wall, i) => {
@@ -196,7 +224,7 @@ function buildStorey(layout: HouseLayout, storey: StoreySpec, lod: Lod, rng: Rng
     layQuoins(builder, a, corners[i], roofCeiling(layout, a), pal, facePaint(storey, [a, b]), rng.fork(`quoins${i}`));
     out.push(builder);
   });
-  return out;
+  return { builders: out, topLongA: corners.map((q) => q[q.length - 1]?.longA ?? false) };
 }
 
 /**
@@ -237,9 +265,10 @@ function quoinBands(y0: number, y1: number, targets: number[], scale: number, rn
  * every course. The short side stays thinner than the wall so the stone stays
  * inside the masonry (it never shows on the inside).
  */
-function planCorner(a: WallSpec, b: WallSpec, bands: number[], scale: number, rng: Rng): Quoin[] {
+function planCorner(a: WallSpec, b: WallSpec, bands: number[], scale: number, firstLongA: boolean | null, rng: Rng): Quoin[] {
   const maxShort = Math.max(0.14, a.thickness - 0.04);
-  const flip = rng.chance(0.5);
+  const coin = rng.chance(0.5);
+  const flip = firstLongA === null ? coin : !firstLongA;
   const quoins: Quoin[] = [];
   for (let k = 0; k + 1 < bands.length; k++) {
     const band = { y0: bands[k], y1: bands[k + 1] };
@@ -257,7 +286,7 @@ function planCorner(a: WallSpec, b: WallSpec, bands: number[], scale: number, rn
     // reach all the way to it (as long as it still fits inside the masonry).
     if (freeA - alongA < MIN_STONE + 0.03 && Math.min(freeA, alongB) <= maxShort) alongA = freeA;
     if (freeB - alongB < MIN_STONE + 0.03 && Math.min(alongA, freeB) <= maxShort) alongB = freeB;
-    quoins.push({ ...band, alongA, alongB });
+    quoins.push({ ...band, alongA, alongB, longA: aLong });
   }
   return quoins;
 }
@@ -928,16 +957,16 @@ function facePaint(storey: StoreySpec, walls: WallSpec[]): Paint {
 }
 
 /**
- * Level of detail for a house. `layout.detail` drops below 1 on big houses:
- * their stones lose the round corner points and grow a little (up to +25 %).
- * If the estimated triangle count is still over target, the stones grow
- * further (up to MAX_SCALE).
+ * Level of detail for a house. `layout.detail` drops below 1 on big houses,
+ * which are seen from further away: their stones grow a little (up to +25 %).
+ * If the estimated triangle count is still over target, the stones lose the
+ * round corner points, then grow further (up to MAX_SCALE).
  */
 function stoneLod(layout: HouseLayout): Lod {
   const area = stoneArea(layout);
   const coarse = THREE.MathUtils.clamp(1 - layout.detail, 0, 0.55);
   let scale = 1 + 0.45 * coarse;
-  let perCorner: 2 | 3 = layout.detail < 0.72 ? 2 : 3;
+  let perCorner: 2 | 3 = 3;
   const estimate = () => (area * TRIANGLES_PER_M2 * (perCorner === 2 ? 0.7 : 1)) / (scale * scale);
   if (estimate() > TRIANGLE_TARGET) perCorner = 2;
   if (estimate() > TRIANGLE_TARGET) scale = Math.min(MAX_SCALE, scale * Math.sqrt(estimate() / TRIANGLE_TARGET));

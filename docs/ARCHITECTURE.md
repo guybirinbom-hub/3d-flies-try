@@ -30,7 +30,7 @@ HouseParams ──computeLayout──▶ HouseLayout ──parts──▶ PartBu
 
 | Part | Owns |
 |---|---|
-| `foundation` | The plinth band on the ground storey's outer faces, `y ∈ [0, plinthHeight]` for every wall style; door steps from the ground up to the door threshold, inside `layout.stoop`. |
+| `foundation` | The plinth band on the ground storey's outer faces, `y ∈ [0, plinthHeight]` for every wall style (it may start a little below ground so it rises straight out of the grass); door steps from the ground up to the door threshold, inside `layout.stoop`. |
 | `walls` | The solid wall bodies (plaster, or mortar colour on stone storeys) with holes for openings, incl. gable triangles. |
 | `stonework` | Individual stones on the outer face of every `style === 'stone'` wall from `floorY` (ground storey) or `y0` up to `y1` / the gable slope; corner quoins. Never inside an opening `surround`. |
 | `timber` | Half-timber framing on every `style === 'timber'` wall (sill beam, top plate, corner posts, studs, braces, gable framing), plus floor bands / joist ends between storeys, especially under jetties. Never inside an opening `surround`. |
@@ -77,8 +77,9 @@ flower-box brackets, shutter pintles, lantern back plates).
 `storey.jettyAbove` is how far the storey above projects (front and back) and
 `storey.joistZone` the height of the joist layer at the top of the storey's
 walls (`y ∈ [y1 - joistZone, y1]`). The timber part lays the joist ends there
-(they reach out to `w = jettyAbove + 0.03`); stonework stops below it on the
-eave walls and door hoods stay under it.
+(they reach out to `w = jettyAbove + 0.03`); on stone eave walls stonework
+fills the layer with small packing stones (w ≤ 0.06, clear of the corners)
+that the joists stand in front of, and door hoods stay under it.
 
 ## Building geometry
 
