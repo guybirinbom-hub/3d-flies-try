@@ -15,6 +15,8 @@ import './viewer/panel.css';
  *   seed=N         random house for seed N (default: hand-tuned default house)
  *   p.<key>=v      override one HouseParams field, e.g. p.floors=1
  *   cam=<preset>   iso | iso2 | front | back | left | right | top | door | eave | low
+ *                  | corner | stoop | peak | chimney (close-ups)
+ *   eye=x,y,z&at=x,y,z   explicit camera position and target (world metres)
  *   parts=a,b      only build these parts
  *   explode=0..1   exploded view
  *   gallery=N      N houses (seed, seed+1, …) as a little village
@@ -133,6 +135,17 @@ function setCamera(preset: CameraPreset): void {
   stage.controls.update();
 }
 
+/** `eye=x,y,z&at=x,y,z` in the URL overrides the preset (for reviewing any spot). */
+function cameraFromUrl(): boolean {
+  const eye = q.get('eye')?.split(',').map(Number);
+  const at = q.get('at')?.split(',').map(Number);
+  if (eye?.length !== 3 || at?.length !== 3 || [...eye, ...at].some((v) => !Number.isFinite(v))) return false;
+  stage.camera.position.set(eye[0], eye[1], eye[2]);
+  stage.controls.target.set(at[0], at[1], at[2]);
+  stage.controls.update();
+  return true;
+}
+
 async function exportGLB(): Promise<ArrayBuffer> {
   const exporter = new GLTFExporter();
   const target = houses.length === 1 ? houses[0].group : world;
@@ -173,7 +186,7 @@ rebuild();
 const camPreset = (CAMERA_PRESETS as readonly string[]).includes(q.get('cam') ?? '')
   ? (q.get('cam') as CameraPreset)
   : 'iso';
-setCamera(camPreset);
+if (!cameraFromUrl()) setCamera(camPreset);
 stage.observeResize(container);
 
 // Headless shots (ui=0) render on demand only: software WebGL is slow and a

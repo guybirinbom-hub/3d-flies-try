@@ -2,7 +2,23 @@ import * as THREE from 'three';
 import type { HouseLayout } from '../gen/layout';
 import { wallPoint } from '../gen/layout';
 
-export const CAMERA_PRESETS = ['iso', 'iso2', 'front', 'back', 'left', 'right', 'top', 'door', 'eave', 'low'] as const;
+export const CAMERA_PRESETS = [
+  'iso',
+  'iso2',
+  'front',
+  'back',
+  'left',
+  'right',
+  'top',
+  'door',
+  'eave',
+  'low',
+  // close-ups for reviewing joints
+  'corner',
+  'stoop',
+  'peak',
+  'chimney',
+] as const;
 export type CameraPreset = (typeof CAMERA_PRESETS)[number];
 
 /** Position + target for a named viewpoint around a house. */
@@ -55,6 +71,35 @@ export function cameraFor(
       const r = layout.roof;
       const c = new THREE.Vector3(r.maxX, r.eaveY + 0.6, r.halfDepth);
       return { position: c.clone().add(new THREE.Vector3(3.2, 0.6, 3.4)), target: c };
+    }
+    case 'corner': {
+      // Front-right corner at plinth level: plinth, quoins / corner posts.
+      const s0 = layout.storeys[0];
+      const c = new THREE.Vector3(s0.maxX, s0.floorY + 0.6, s0.maxZ);
+      return { position: c.clone().add(new THREE.Vector3(2.0, 0.5, 2.3)), target: c };
+    }
+    case 'stoop': {
+      const d = layout.door;
+      const wall = layout.walls.find((w) => w.id === d.wallId)!;
+      const c = wallPoint(wall, (d.u0 + d.u1) / 2, layout.stoop.topY, 0.3);
+      const n = new THREE.Vector3(wall.normal.x, 0, wall.normal.z);
+      const side = new THREE.Vector3(wall.dir.x, 0, wall.dir.z);
+      return {
+        position: c.clone().add(n.multiplyScalar(2.6)).add(side.multiplyScalar(-1.4)).add(new THREE.Vector3(0, 1.1, 0)),
+        target: c,
+      };
+    }
+    case 'peak': {
+      // Right gable apex: barge boards, ridge end, gable framing.
+      const r = layout.roof;
+      const c = new THREE.Vector3(r.maxX, r.ridgeY - 0.4, 0);
+      return { position: c.clone().add(new THREE.Vector3(3.6, -0.2, 2.6)), target: c };
+    }
+    case 'chimney': {
+      const ch = layout.chimney;
+      if (!ch) return cameraFor('iso', layout, fovDeg, aspect);
+      const c = new THREE.Vector3(ch.x, ch.y1 - 0.9, ch.z);
+      return { position: c.clone().add(new THREE.Vector3(Math.sign(ch.x || 1) * 2.4, 1.6, 3.4)), target: c };
     }
   }
 }

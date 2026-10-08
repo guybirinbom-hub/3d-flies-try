@@ -56,6 +56,20 @@ Wall-mounted layers must keep to these ranges so nothing z-fights or pokes throu
 
 Opening frames and glass sit inside the hole around `w = opening.recess`.
 
+The ranges are for **visible** geometry. Hidden parts may go deeper into the
+wall body (corner blocks, corner posts, plinth bond stones, never past
+`w = -thickness + 0.05`), and small fixings may pass into the wall face to
+attach anything that would otherwise float (door-hood deck and brackets,
+flower-box brackets, shutter pintles, lantern back plates).
+
+### Storey boundaries and jetties
+
+`storey.jettyAbove` is how far the storey above projects (front and back) and
+`storey.joistZone` the height of the joist layer at the top of the storey's
+walls (`y ∈ [y1 - joistZone, y1]`). The timber part lays the joist ends there
+(they reach out to `w = jettyAbove + 0.03`); stonework stops below it on the
+eave walls and door hoods stay under it.
+
 ## Building geometry
 
 - `PartBuilder` (src/gen/builder.ts) collects geometry per **material slot** (`MatKey`) with **vertex colours**, and merges it into one mesh per slot. Materials are shared and white; all colour is vertex colour.
@@ -76,6 +90,8 @@ Cozy, storybook, "Tiny Glade"-like:
 ## Tooling
 
 - `npm run dev` — interactive viewer with controls.
-- `node scripts/shoot.mjs --out shots/x name="query" …` — headless screenshots (software WebGL, ~5 s each). Query params: `seed`, `p.<param>=value`, `cam=iso|iso2|front|back|left|right|top|door|eave|low`, `parts=a,b`, `explode=0..1`, `gallery=N`, `ao=0`. Add `--glb` to also export `.glb`.
+- `node scripts/shoot.mjs --out shots/x name="query" …` — headless screenshots (software WebGL, ~5 s each). Query params: `seed`, `p.<param>=value`, `cam=iso|iso2|front|back|left|right|top|door|eave|low|corner|stoop|peak|chimney`, `eye=x,y,z&at=x,y,z`, `parts=a,b`, `explode=0..1`, `gallery=N`, `ao=0`. Add `--glb` to also export `.glb`.
+- `node scripts/ui-shot.mjs` — screenshots of the interactive viewer with its panel (desktop/phone, light/dark).
+- `node scripts/build-artifact.mjs --out page.html` — the viewer as one self-contained HTML fragment.
 - `node scripts/sweep.mjs --count 300 [--parts a,b] [--set p.floors=3]` — generates many houses in Node and reports exceptions, console errors, NaNs and runaway geometry.
 - `npx tsc --noEmit` — typecheck.
