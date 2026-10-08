@@ -1,0 +1,422 @@
+/* Layout: full-bleed 3D viewport with a docked builder's sheet on the right (bottom sheet on phones). */
+:root {
+  --paper: #f3f5f0; /* panel ground: sage-biased off-white */
+  --ink: #1f2b25;
+  --muted: #5d6b63;
+  --line: #d5ddd4;
+  --well: #e7ece5; /* inset controls */
+  --moss: #2d6a58; /* the one accent */
+  --moss-ink: #f4f8f5;
+  --sky: #dfe9ec; /* behind the canvas while it loads */
+  --overlay: rgba(243, 245, 240, 0.86);
+
+  --font-display: 'Bricolage Grotesque', 'Avenir Next', 'Segoe UI', system-ui, sans-serif;
+  --font-body: 'Instrument Sans', 'Helvetica Neue', 'Segoe UI', system-ui, sans-serif;
+  --font-data: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+
+  --step--1: 0.75rem;
+  --step-0: 0.875rem;
+  --step-1: 1.05rem;
+  --step-2: 1.45rem;
+  --radius: 10px;
+  --sheet-w: 340px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --paper: #161d1a;
+    --ink: #e4ebe6;
+    --muted: #97a59d;
+    --line: #2b3832;
+    --well: #1f2924;
+    --moss: #79c2a7;
+    --moss-ink: #0f1714;
+    --sky: #1c2422;
+    --overlay: rgba(22, 29, 26, 0.86);
+    color-scheme: dark;
+  }
+}
+:root[data-theme='dark'] {
+  --paper: #161d1a;
+  --ink: #e4ebe6;
+  --muted: #97a59d;
+  --line: #2b3832;
+  --well: #1f2924;
+  --moss: #79c2a7;
+  --moss-ink: #0f1714;
+  --sky: #1c2422;
+  --overlay: rgba(22, 29, 26, 0.86);
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: var(--step-0);
+  overflow: hidden;
+}
+
+.shell {
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--sheet-w);
+}
+.viewport {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  background: var(--sky);
+}
+.viewport canvas {
+  display: block;
+  touch-action: none;
+}
+
+/* --- overlays on the viewport ------------------------------------------ */
+.nameplate {
+  position: absolute;
+  left: 16px;
+  top: 14px;
+  display: grid;
+  gap: 2px;
+  padding: 10px 14px 9px;
+  background: var(--overlay);
+  border-radius: var(--radius);
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+  max-width: calc(100% - 32px);
+}
+.nameplate h1 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 650;
+  font-size: var(--step-2);
+  letter-spacing: -0.01em;
+  line-height: 1.1;
+  text-wrap: balance;
+}
+.readout {
+  font-family: var(--font-data);
+  font-size: var(--step--1);
+  color: var(--muted);
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.views {
+  position: absolute;
+  left: 16px;
+  bottom: 14px;
+  right: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  pointer-events: none;
+}
+.views button {
+  pointer-events: auto;
+}
+
+/* --- the sheet --------------------------------------------------------- */
+.sheet {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  border-left: 1px solid var(--line);
+  background: var(--paper);
+}
+.sheet-head {
+  display: grid;
+  gap: 12px;
+  padding: 16px 16px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.sheet-body {
+  overflow-y: auto;
+  padding-inline: 16px;
+  padding-block: 4px 16px;
+}
+.sheet-foot {
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  font-family: var(--font-data);
+  font-size: var(--step--1);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.grabber {
+  display: none;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.row > * {
+  flex: 1 1 auto;
+}
+
+button,
+.chip {
+  font: inherit;
+  font-weight: 560;
+  color: var(--ink);
+  background: var(--well);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+button:hover {
+  border-color: var(--muted);
+}
+button:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--moss);
+  outline-offset: 2px;
+}
+button.primary {
+  background: var(--moss);
+  border-color: var(--moss);
+  color: var(--moss-ink);
+}
+.views button {
+  padding: 5px 10px;
+  font-size: var(--step--1);
+  background: var(--overlay);
+  backdrop-filter: blur(6px);
+}
+.views button[aria-pressed='true'] {
+  background: var(--moss);
+  border-color: var(--moss);
+  color: var(--moss-ink);
+}
+
+/* sections */
+details {
+  border-bottom: 1px solid var(--line);
+}
+details:last-child {
+  border-bottom: 0;
+}
+summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 13px 0 11px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-family: var(--font-display);
+  font-weight: 620;
+  font-size: var(--step-1);
+}
+summary::-webkit-details-marker {
+  display: none;
+}
+summary::after {
+  content: '+';
+  font-family: var(--font-data);
+  color: var(--muted);
+}
+details[open] summary::after {
+  content: '–';
+}
+.fields {
+  display: grid;
+  gap: 14px;
+  padding-bottom: 16px;
+}
+
+/* a labelled control */
+.field {
+  display: grid;
+  gap: 6px;
+}
+.field-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+.field label,
+.field .label {
+  font-size: var(--step--1);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.value {
+  font-family: var(--font-data);
+  font-size: var(--step--1);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+input[type='range'] {
+  width: 100%;
+  accent-color: var(--moss);
+  margin: 0;
+}
+
+.segmented {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  background: var(--well);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 2px;
+  gap: 2px;
+}
+.segmented button {
+  border: 0;
+  background: transparent;
+  padding: 6px 4px;
+  font-size: var(--step--1);
+  border-radius: 6px;
+}
+.segmented button[aria-pressed='true'] {
+  background: var(--paper);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.switch {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: 520;
+}
+.switch input {
+  appearance: none;
+  width: 34px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--line);
+  position: relative;
+  cursor: pointer;
+  transition: background 0.15s;
+  flex: none;
+  margin: 0;
+}
+.switch input::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--paper);
+  transition: transform 0.15s;
+}
+.switch input:checked {
+  background: var(--moss);
+}
+.switch input:checked::after {
+  transform: translateX(14px);
+}
+.switches {
+  display: grid;
+  gap: 10px;
+}
+
+.swatches {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+.swatch {
+  padding: 0;
+  height: 38px;
+  border-radius: 8px;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: 3fr 2fr;
+  border: 2px solid transparent;
+}
+.swatch[aria-pressed='true'] {
+  border-color: var(--moss);
+}
+.swatch span {
+  display: block;
+}
+.swatch .lower {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+.hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--step--1);
+  line-height: 1.45;
+}
+
+@media (max-width: 760px) {
+  .shell {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+  .sheet {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    max-height: 48vh;
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+  }
+  .sheet.collapsed .sheet-body,
+  .sheet.collapsed .sheet-foot {
+    display: none;
+  }
+  .grabber {
+    display: block;
+    border: 0;
+    background: transparent;
+    padding: 6px 0 0;
+    font-size: var(--step--1);
+    color: var(--muted);
+    width: 100%;
+  }
+  .nameplate h1 {
+    font-size: var(--step-1);
+  }
+  .views {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    pointer-events: auto;
+    scrollbar-width: none;
+  }
+  .views button {
+    flex: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}
+
+/* Headless screenshot mode: just the scene. */
+.bare .shell {
+  grid-template-columns: minmax(0, 1fr);
+}
+.bare .sheet,
+.bare .nameplate,
+.bare .views {
+  display: none;
+}

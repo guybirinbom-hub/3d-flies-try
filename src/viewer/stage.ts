@@ -72,12 +72,17 @@ export class Stage {
     this.composer.addPass(this.aoPass);
     this.composer.addPass(new OutputPass());
 
-    window.addEventListener('resize', () => this.resize(container));
+  }
+
+  /** Keep the canvas matched to its container (window resizes, panel folding). */
+  observeResize(container: HTMLElement): void {
+    new ResizeObserver(() => this.resize(container)).observe(container);
   }
 
   resize(container: HTMLElement): void {
     const w = container.clientWidth;
     const h = container.clientHeight;
+    if (!w || !h) return;
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
