@@ -1543,9 +1543,10 @@ function plantAlongWall(b: PartBuilder, rng: Rng, site: Site, wall: WallSpec, lu
       u += 0.25;
       continue;
     }
+    const shrubW = rng.range(0.55, 1.0);
     const size =
       kind === 'shrub'
-        ? { w: rng.range(0.55, 1.0), h: Math.min(probe - 0.06, rng.range(0.5, 0.95)) }
+        ? { w: shrubW, h: Math.min(probe - 0.06, shrubW * rng.range(0.7, 0.95)) } // bushes are wider than tall
         : kind === 'hollyhock'
           ? { w: rng.range(0.35, 0.55), h: Math.min(probe - 0.1, rng.range(1.15, 1.75)) }
           : { w: rng.range(0.4, 0.7), h: Math.min(probe - 0.05, rng.range(0.22, 0.36)) };
@@ -1553,7 +1554,9 @@ function plantAlongWall(b: PartBuilder, rng: Rng, site: Site, wall: WallSpec, lu
     const depth = kind === 'hollyhock' ? size.w * 0.8 : size.w * rng.range(0.8, 1);
     // Plants may nestle into each other a little, but keep clear of paths and solid things.
     const fp = site.standAgainst(wall, u, u + size.w, WALL_GAP, WALL_GAP + depth, size.h, 0.03, -0.06);
-    if (!fp) {
+    // Tall spires sway a little: give them some extra room from the windows on either side.
+    const spireClear = kind !== 'hollyhock' || site.heightLimit(wall, u - 0.15, u + size.w + 0.15) >= size.h;
+    if (!fp || !spireClear) {
       u += 0.2;
       continue;
     }
@@ -1729,16 +1732,18 @@ function addHollyhocks(b: PartBuilder, rng: Rng, m: THREE.Matrix4, width: number
   const leaf = vary(rng.pick(LEAVES), rng, 0.05, 0.05, 0.012);
   addShrubBlob(b, rng, m, 0, 0.1, 0, (width / 2 - 0.02) / BLOB_BULGE, 0.3, (depth / 2 - 0.02) / BLOB_BULGE, leaf, 1, 0.4);
   const n = rng.int(2, 4);
+  // Leaves reach ~0.12 m sideways from a stem: keep them inside the footprint.
+  const spread = Math.max(0, width / 2 - 0.13);
   for (let i = 0; i < n; i++) {
-    const x = -width * 0.3 + (width * 0.6 * i) / (n - 1) + rng.jitter(0.04);
+    const x = -spread + (2 * spread * i) / (n - 1);
     const z = rng.jitter(depth * 0.15);
     const h = height * rng.range(0.78, 1);
     // Stems lean a little away from the wall (local +z), never into it.
-    const sm = mul(m, mat4(x, 0, z, rng.range(0, 0.07), 0, rng.jitter(0.08)));
+    const sm = mul(m, mat4(x, 0, z, rng.range(0, 0.07), 0, rng.jitter(0.035)));
     b.add(HOLLYHOCK_STEM, 'foliage', vary('#6f8f4a', rng, 0.04, 0.04, 0.01), mul(sm, mat4(0, 0, 0, 0, 0, 0, 1, h, 1)));
     // Broad leaves on the lower stem.
     for (let y = 0.32; y < h * 0.45; y += rng.range(0.12, 0.17)) {
-      const a = rng.range(Math.PI * 1.05, Math.PI * 1.95); // leaves point away from the wall
+      const a = rng.range(Math.PI * 1.25, Math.PI * 1.75); // leaves point away from the wall
       const lm = mul(sm, mat4(Math.cos(a) * 0.06, y, -Math.sin(a) * 0.06, 0, a, -0.35, 0.1, 0.022, 0.075));
       b.add(PEBBLE, 'foliage', vary(leaf, rng, 0.04, 0.03, 0.01), lm);
     }
