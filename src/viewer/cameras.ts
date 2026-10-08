@@ -64,6 +64,9 @@ export function fitDistance(
  */
 export function framingBox(layout: HouseLayout, explode = 0): THREE.Box3 {
   const box = new THREE.Box3(layout.bounds.min.clone(), layout.bounds.max.clone());
+  // Take in the steps, path and the front of the garden at ground level.
+  box.expandByPoint(new THREE.Vector3(box.min.x - 1.2, 0, box.max.z + 2.2));
+  box.expandByPoint(new THREE.Vector3(box.max.x + 1.2, 0, box.max.z + 2.2));
   if (explode > 0) {
     box.max.y += explode * (roofLift(layout) + 1.6);
     box.expandByVector(new THREE.Vector3(OUTWARD.openings, 0, OUTWARD.openings).multiplyScalar(explode));

@@ -187,10 +187,11 @@ export function defaultParams(): HouseParams {
 /** A coherent random house for a seed. Same seed → same house. */
 export function randomParams(seed: number): HouseParams {
   const rng = new Rng(seed).fork('params');
+  // Mostly cottages and two-storey houses; three storeys are the rare town house.
   const floors = rng.weighted([
-    [1, 3],
+    [1, 4],
     [2, 5],
-    [3, 1],
+    [3, 0.7],
   ] as const);
   // Chunky rather than tall: three storeys need a big footprint.
   const width = round(floors === 3 ? rng.range(9, 12) : rng.range(floors === 1 ? 6 : 7, 11), 0.1);
@@ -208,8 +209,9 @@ export function randomParams(seed: number): HouseParams {
       : groundStyle === 'timber'
         ? rng.weighted([['timber', 6], ['plaster', 1]] as const)
         : rng.weighted([['timber', 5], ['plaster', 3], ['stone', groundStyle === 'stone' ? 2 : 0]] as const);
-  // Cottages get steep roofs, tall houses gentler ones.
-  const roofPitch = Math.round(floors === 1 ? rng.range(45, 57) : floors === 2 ? rng.range(40, 54) : rng.range(38, 47));
+  // A big roof over low walls is what makes it cosy: cottages get steep roofs,
+  // tall houses gentler ones.
+  const roofPitch = Math.round(floors === 1 ? rng.range(46, 57) : floors === 2 ? rng.range(43, 55) : rng.range(38, 47));
   const base = PALETTES[rng.pick(Object.keys(PALETTES))];
   const palette: Palette = {
     ...base,
@@ -232,7 +234,7 @@ export function randomParams(seed: number): HouseParams {
     width,
     depth,
     floors,
-    storeyHeight: round(rng.range(2.5, 2.8), 0.05),
+    storeyHeight: round(rng.range(2.4, 2.7), 0.05),
     plinthHeight: round(rng.range(floors === 3 ? 0.25 : 0.3, floors === 3 ? 0.45 : 0.6), 0.05),
     wallThickness: round(rng.range(0.36, 0.48), 0.01),
     groundStyle,

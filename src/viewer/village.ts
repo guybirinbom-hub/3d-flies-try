@@ -14,9 +14,9 @@ export interface Placement {
   rotY: number;
 }
 
-/** Half the footprint "width" a house needs along the ring (incl. roof overhang and props). */
+/** Half the footprint "width" a house needs along the ring (incl. roof overhang, garden and props). */
 function halfSpan(l: HouseLayout): number {
-  return Math.max(l.bounds.max.x, -l.bounds.min.x) + 1.6;
+  return Math.max(l.bounds.max.x, -l.bounds.min.x) + 3.2;
 }
 
 export function placeAroundGreen(layouts: HouseLayout[], rng: Rng): Placement[] {

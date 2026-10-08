@@ -38,7 +38,7 @@ HouseParams ──computeLayout──▶ HouseLayout ──parts──▶ PartBu
 | `roof` | Deck (incl. soffit underside), tile courses, ridge cap, barge boards, fascia. Leaves every `layout.roof.holes` rectangle open (tiles trimmed, ridge split where a hole crosses it) and exports `tileCourses(layout)` / `CALM_ZONE` so the owner of a hole can dress flashing exactly over the real tile tops. |
 | `dormers` | Every dormer in `layout.roof.dormers`: face wall, cheeks, window, its own little roof, and the flashing/valleys where it meets the main roof (the roof leaves `roof.holes` open). |
 | `chimney` | The stack from `chimney.y0` to `chimney.y1`, cap, pots, and lead flashing (or a lime-mortar fillet on rustic stone stacks) where it meets the roof. |
-| `props` | Small things around the house: path (starting at the outer edge of `layout.stoop`), lantern by the door, bench/barrel/woodpile, potted plants, shrubs and flowers along the base. Never inside `layout.stoop`, never blocks the door. |
+| `props` | The setting: path (starting at the outer edge of `layout.stoop`), lantern by the door, bench/barrels, woodpile or lean-to woodshed, potted plants, planting and climbers, and a garden plot (picket fence or dry-stone wall with a gate on the path, beds, fruit trees, worn ground). Never inside `layout.stoop`, `layout.doorHood` or window zones, never blocks the door. |
 
 ### Depth (w) budget — what sits in front of what
 
@@ -98,7 +98,7 @@ Cozy, storybook, "Tiny Glade"-like:
 - **Hand-made irregularity.** Small random rotations (1–3°), offsets and sizes per stone/tile/plank; per-piece colour variation with `vary()` (a few % lightness).
 - **Palette** comes from `params.palette`; never pure black or white.
 - **Readable at a distance**: a few strong shapes first, detail second.
-- **Budget**: whole house ≲ 300k triangles. Rough per part: stonework 120k, roof 120k, openings 40k, foundation 25k, props 30k, timber 20k, chimney 10k.
+- **Budget**: whole house ≲ 300k triangles. Rough per part: stonework 110k, roof 120k, openings 45k, props 40k, dormers ≈7k each, foundation 25k, timber 20k, chimney 10k. Use `layout.detail` to stay inside it on big houses.
 
 ## Tooling
 
