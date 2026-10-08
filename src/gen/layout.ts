@@ -457,8 +457,12 @@ export function computeLayout(p: HouseParams): HouseLayout {
     const sz = round(rng.range(0.55, 0.75), 0.05);
     const sign = p.chimneySide === 'right' ? 1 : -1;
     const x = sign * (top.maxX - t - sx / 2 - rng.range(0.15, 0.6));
-    // Either straddling the ridge, or poking out of the back slope.
-    const z = rng.chance(0.55) ? 0 : -round(rng.range(0.25, 0.45) * top.maxZ, 0.05);
+    // Either straddling the ridge, or poking out of the back slope. Off the
+    // ridge the stack must still clear it, so keep the drop between the stack's
+    // foot and the ridge modest (≤ 1.2 m) or it turns into a tower.
+    const onRidge = rng.chance(0.55) || pitch > (55 * Math.PI) / 180;
+    const maxOff = Math.max(0, 1.2 / Math.tan(pitch) - sz / 2);
+    const z = onRidge ? 0 : -round(Math.min(rng.range(0.25, 0.45) * top.maxZ, maxOff), 0.05);
     const surfaceAtHighSide = roofSurfaceY(roof, Math.max(0, Math.abs(z) - sz / 2));
     chimney = {
       x,
